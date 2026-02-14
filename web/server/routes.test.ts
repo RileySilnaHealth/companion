@@ -13,11 +13,28 @@ vi.mock("node:child_process", () => ({
   execSync: vi.fn(() => ""),
 }));
 
+const mockResolveBinary = vi.hoisted(() => vi.fn((_name: string) => null as string | null));
+vi.mock("./path-resolver.js", () => ({
+  resolveBinary: mockResolveBinary,
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: vi.fn(() => false),
+    readFileSync: vi.fn(() => ""),
+  };
+});
+
 vi.mock("./git-utils.js", () => ({
   getRepoInfo: vi.fn(() => null),
   listBranches: vi.fn(() => []),
   listWorktrees: vi.fn(() => []),
   ensureWorktree: vi.fn(),
+  gitFetch: vi.fn(() => ({ success: true, output: "" })),
+  gitPull: vi.fn(() => ({ success: true, output: "" })),
+  checkoutBranch: vi.fn(),
   removeWorktree: vi.fn(),
   isWorktreeDirty: vi.fn(() => false),
 }));
@@ -30,12 +47,52 @@ vi.mock("./session-names.js", () => ({
   _resetForTest: vi.fn(),
 }));
 
+vi.mock("./settings-manager.js", () => ({
+  DEFAULT_OPENROUTER_MODEL: "openrouter/free",
+  getSettings: vi.fn(() => ({
+    openrouterApiKey: "",
+    openrouterModel: "openrouter/free",
+    updatedAt: 0,
+  })),
+  updateSettings: vi.fn((patch) => ({
+    openrouterApiKey: patch.openrouterApiKey ?? "",
+    openrouterModel: patch.openrouterModel ?? "openrouter/free",
+    updatedAt: Date.now(),
+  })),
+}));
+
+const mockGetUsageLimits = vi.hoisted(() => vi.fn());
+const mockUpdateCheckerState = vi.hoisted(() => ({
+  currentVersion: "0.22.1",
+  latestVersion: null as string | null,
+  lastChecked: 0,
+  isServiceMode: false,
+  checking: false,
+  updateInProgress: false,
+}));
+const mockCheckForUpdate = vi.hoisted(() => vi.fn(async () => {}));
+const mockIsUpdateAvailable = vi.hoisted(() => vi.fn(() => false));
+const mockSetUpdateInProgress = vi.hoisted(() => vi.fn());
+
+vi.mock("./usage-limits.js", () => ({
+  getUsageLimits: mockGetUsageLimits,
+}));
+
+vi.mock("./update-checker.js", () => ({
+  getUpdateState: vi.fn(() => ({ ...mockUpdateCheckerState })),
+  checkForUpdate: mockCheckForUpdate,
+  isUpdateAvailable: mockIsUpdateAvailable,
+  setUpdateInProgress: mockSetUpdateInProgress,
+}));
+
 import { Hono } from "hono";
 import { execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { createRoutes } from "./routes.js";
 import * as envManager from "./env-manager.js";
 import * as gitUtils from "./git-utils.js";
 import * as sessionNames from "./session-names.js";
+import * as settingsManager from "./settings-manager.js";
 
 // ─── Mock factories ──────────────────────────────────────────────────────────
 
@@ -59,6 +116,9 @@ function createMockLauncher() {
 function createMockBridge() {
   return {
     closeSession: vi.fn(),
+    getSession: vi.fn(() => null),
+    getAllSessions: vi.fn(() => []),
+    getCodexRateLimits: vi.fn(() => null),
   } as any;
 }
 
@@ -87,12 +147,19 @@ let tracker: ReturnType<typeof createMockTracker>;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockUpdateCheckerState.currentVersion = "0.22.1";
+  mockUpdateCheckerState.latestVersion = null;
+  mockUpdateCheckerState.lastChecked = 0;
+  mockUpdateCheckerState.isServiceMode = false;
+  mockUpdateCheckerState.checking = false;
+  mockUpdateCheckerState.updateInProgress = false;
   launcher = createMockLauncher();
   bridge = createMockBridge();
   sessionStore = createMockStore();
   tracker = createMockTracker();
   app = new Hono();
-  app.route("/api", createRoutes(launcher, bridge, sessionStore, tracker));
+  const terminalManager = { getInfo: () => null, spawn: () => "", kill: () => {} } as any;
+  app.route("/api", createRoutes(launcher, bridge, sessionStore, tracker, terminalManager));
 });
 
 // ─── Sessions ────────────────────────────────────────────────────────────────
@@ -187,6 +254,106 @@ describe("POST /api/sessions/create", () => {
     );
   });
 
+  it("fetches and pulls before create when branch matches current branch", async () => {
+    vi.mocked(gitUtils.getRepoInfo).mockReturnValue({
+      repoRoot: "/repo",
+      repoName: "my-repo",
+      currentBranch: "main",
+      defaultBranch: "main",
+      isWorktree: false,
+    });
+
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/repo", branch: "main" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(gitUtils.gitFetch).toHaveBeenCalledWith("/repo");
+    expect(gitUtils.checkoutBranch).not.toHaveBeenCalled();
+    expect(gitUtils.gitPull).toHaveBeenCalledWith("/repo");
+  });
+
+  it("fetches, checks out selected branch, then pulls before create", async () => {
+    vi.mocked(gitUtils.getRepoInfo).mockReturnValue({
+      repoRoot: "/repo",
+      repoName: "my-repo",
+      currentBranch: "develop",
+      defaultBranch: "main",
+      isWorktree: false,
+    });
+
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/repo", branch: "main" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(gitUtils.gitFetch).toHaveBeenCalledWith("/repo");
+    expect(gitUtils.checkoutBranch).toHaveBeenCalledWith("/repo", "main");
+    expect(gitUtils.gitPull).toHaveBeenCalledWith("/repo");
+    expect(vi.mocked(gitUtils.gitFetch).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(gitUtils.checkoutBranch).mock.invocationCallOrder[0],
+    );
+    expect(vi.mocked(gitUtils.checkoutBranch).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(gitUtils.gitPull).mock.invocationCallOrder[0],
+    );
+  });
+
+  it("returns 500 and does not launch when fetch fails before create", async () => {
+    vi.mocked(gitUtils.getRepoInfo).mockReturnValue({
+      repoRoot: "/repo",
+      repoName: "my-repo",
+      currentBranch: "main",
+      defaultBranch: "main",
+      isWorktree: false,
+    });
+    vi.mocked(gitUtils.gitFetch).mockReturnValueOnce({
+      success: false,
+      output: "network error",
+    });
+
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/repo", branch: "main" }),
+    });
+
+    expect(res.status).toBe(500);
+    const json = await res.json();
+    expect(json).toEqual({
+      error: "git fetch failed before session create: network error",
+    });
+    expect(gitUtils.gitPull).not.toHaveBeenCalled();
+    expect(launcher.launch).not.toHaveBeenCalled();
+  });
+
+  it("proceeds with session creation when pull fails (non-fatal)", async () => {
+    vi.mocked(gitUtils.getRepoInfo).mockReturnValue({
+      repoRoot: "/repo",
+      repoName: "my-repo",
+      currentBranch: "main",
+      defaultBranch: "main",
+      isWorktree: false,
+    });
+    vi.mocked(gitUtils.gitPull).mockReturnValueOnce({
+      success: false,
+      output: "no tracking information",
+    });
+
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/repo", branch: "main" }),
+    });
+
+    // Pull failure is non-fatal — session should still be created
+    expect(res.status).toBe(200);
+    expect(launcher.launch).toHaveBeenCalled();
+  });
+
   it("returns 500 when launch throws an error", async () => {
     launcher.launch.mockImplementation(() => {
       throw new Error("CLI binary not found");
@@ -201,6 +368,19 @@ describe("POST /api/sessions/create", () => {
     expect(res.status).toBe(500);
     const json = await res.json();
     expect(json).toEqual({ error: "CLI binary not found" });
+  });
+
+  it("returns 400 for invalid backend values", async () => {
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test", backend: "invalid-backend" }),
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toContain("Invalid backend");
+    expect(launcher.launch).not.toHaveBeenCalled();
   });
 });
 
@@ -218,9 +398,57 @@ describe("GET /api/sessions", () => {
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json).toEqual([
-      { sessionId: "s1", state: "running", cwd: "/a", name: "Fix auth bug" },
-      { sessionId: "s2", state: "stopped", cwd: "/b" },
+      {
+        sessionId: "s1", state: "running", cwd: "/a", name: "Fix auth bug",
+        gitBranch: "", gitAhead: 0, gitBehind: 0, totalLinesAdded: 0, totalLinesRemoved: 0,
+      },
+      {
+        sessionId: "s2", state: "stopped", cwd: "/b",
+        gitBranch: "", gitAhead: 0, gitBehind: 0, totalLinesAdded: 0, totalLinesRemoved: 0,
+      },
     ]);
+  });
+
+  it("enriches sessions with git data from bridge state", async () => {
+    const sessions = [
+      { sessionId: "s1", state: "running", cwd: "/a" },
+      { sessionId: "s2", state: "running", cwd: "/b" },
+    ];
+    launcher.listSessions.mockReturnValue(sessions);
+    vi.mocked(sessionNames.getAllNames).mockReturnValue({});
+    bridge.getAllSessions.mockReturnValue([
+      {
+        session_id: "s1",
+        git_branch: "feature/auth",
+        git_ahead: 3,
+        git_behind: 1,
+        total_lines_added: 42,
+        total_lines_removed: 7,
+      },
+    ]);
+
+    const res = await app.request("/api/sessions", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    // s1 should have bridge git data
+    expect(json[0]).toMatchObject({
+      sessionId: "s1",
+      gitBranch: "feature/auth",
+      gitAhead: 3,
+      gitBehind: 1,
+      totalLinesAdded: 42,
+      totalLinesRemoved: 7,
+    });
+    // s2 has no bridge data — defaults to empty/zero
+    expect(json[1]).toMatchObject({
+      sessionId: "s2",
+      gitBranch: "",
+      gitAhead: 0,
+      gitBehind: 0,
+      totalLinesAdded: 0,
+      totalLinesRemoved: 0,
+    });
   });
 });
 
@@ -473,6 +701,147 @@ describe("DELETE /api/envs/:slug", () => {
   });
 });
 
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+describe("GET /api/settings", () => {
+  it("returns settings status without exposing the key", async () => {
+    vi.mocked(settingsManager.getSettings).mockReturnValue({
+      openrouterApiKey: "or-secret",
+      openrouterModel: "openrouter/free",
+      updatedAt: 123,
+    });
+
+    const res = await app.request("/api/settings", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual({
+      openrouterApiKeyConfigured: true,
+      openrouterModel: "openrouter/free",
+    });
+  });
+
+  it("reports key as not configured when empty", async () => {
+    vi.mocked(settingsManager.getSettings).mockReturnValue({
+      openrouterApiKey: "",
+      openrouterModel: "openai/gpt-4o-mini",
+      updatedAt: 123,
+    });
+
+    const res = await app.request("/api/settings", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual({
+      openrouterApiKeyConfigured: false,
+      openrouterModel: "openai/gpt-4o-mini",
+    });
+  });
+});
+
+describe("PUT /api/settings", () => {
+  it("updates settings", async () => {
+    vi.mocked(settingsManager.updateSettings).mockReturnValue({
+      openrouterApiKey: "new-key",
+      openrouterModel: "openrouter/free",
+      updatedAt: 456,
+    });
+
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ openrouterApiKey: "new-key" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(settingsManager.updateSettings).toHaveBeenCalledWith({
+      openrouterApiKey: "new-key",
+      openrouterModel: undefined,
+    });
+    const json = await res.json();
+    expect(json).toEqual({
+      openrouterApiKeyConfigured: true,
+      openrouterModel: "openrouter/free",
+    });
+  });
+
+  it("trims key and falls back to default model for blank value", async () => {
+    vi.mocked(settingsManager.updateSettings).mockReturnValue({
+      openrouterApiKey: "trimmed-key",
+      openrouterModel: "openrouter/free",
+      updatedAt: 789,
+    });
+
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ openrouterApiKey: "  trimmed-key  ", openrouterModel: "   " }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(settingsManager.updateSettings).toHaveBeenCalledWith({
+      openrouterApiKey: "trimmed-key",
+      openrouterModel: "openrouter/free",
+    });
+  });
+
+  it("updates only model without overriding key", async () => {
+    vi.mocked(settingsManager.updateSettings).mockReturnValue({
+      openrouterApiKey: "existing-key",
+      openrouterModel: "openai/gpt-4o-mini",
+      updatedAt: 999,
+    });
+
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ openrouterModel: "openai/gpt-4o-mini" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(settingsManager.updateSettings).toHaveBeenCalledWith({
+      openrouterApiKey: undefined,
+      openrouterModel: "openai/gpt-4o-mini",
+    });
+  });
+
+  it("returns 400 for non-string model", async () => {
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ openrouterApiKey: "new-key", openrouterModel: 123 }),
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json).toEqual({ error: "openrouterModel must be a string" });
+  });
+
+  it("returns 400 for non-string key", async () => {
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ openrouterApiKey: 123 }),
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json).toEqual({ error: "openrouterApiKey must be a string" });
+  });
+
+  it("returns 400 when no settings fields are provided", async () => {
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json).toEqual({ error: "At least one settings field is required" });
+  });
+});
+
 // ─── Git ─────────────────────────────────────────────────────────────────────
 
 describe("GET /api/git/repo-info", () => {
@@ -633,6 +1002,39 @@ describe("PATCH /api/sessions/:id/name", () => {
   });
 });
 
+// ─── Update checking ────────────────────────────────────────────────────────
+
+describe("GET /api/update-check", () => {
+  it("triggers a refresh when never checked", async () => {
+    mockUpdateCheckerState.lastChecked = 0;
+
+    const res = await app.request("/api/update-check", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    expect(mockCheckForUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("does not trigger a refresh when the previous check is fresh", async () => {
+    mockUpdateCheckerState.lastChecked = Date.now();
+
+    const res = await app.request("/api/update-check", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    expect(mockCheckForUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/update-check", () => {
+  it("always forces a refresh", async () => {
+    mockUpdateCheckerState.lastChecked = Date.now();
+
+    const res = await app.request("/api/update-check", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    expect(mockCheckForUpdate).toHaveBeenCalledOnce();
+  });
+});
+
 // ─── Filesystem ──────────────────────────────────────────────────────────────
 
 describe("GET /api/fs/home", () => {
@@ -646,6 +1048,67 @@ describe("GET /api/fs/home", () => {
     expect(typeof json.home).toBe("string");
     expect(typeof json.cwd).toBe("string");
   });
+
+  it("returns home as cwd when process.cwd() is the package root", async () => {
+    const origCwd = process.cwd;
+    const origEnv = process.env.__COMPANION_PACKAGE_ROOT;
+    try {
+      process.env.__COMPANION_PACKAGE_ROOT = "/opt/companion";
+      process.cwd = () => "/opt/companion";
+      const res = await app.request("/api/fs/home", { method: "GET" });
+      const json = await res.json();
+      expect(json.cwd).toBe(json.home);
+    } finally {
+      process.cwd = origCwd;
+      process.env.__COMPANION_PACKAGE_ROOT = origEnv;
+    }
+  });
+
+  it("returns home as cwd when process.cwd() is inside the package root", async () => {
+    const origCwd = process.cwd;
+    const origEnv = process.env.__COMPANION_PACKAGE_ROOT;
+    try {
+      process.env.__COMPANION_PACKAGE_ROOT = "/opt/companion";
+      process.cwd = () => "/opt/companion/node_modules/.bin";
+      const res = await app.request("/api/fs/home", { method: "GET" });
+      const json = await res.json();
+      expect(json.cwd).toBe(json.home);
+    } finally {
+      process.cwd = origCwd;
+      process.env.__COMPANION_PACKAGE_ROOT = origEnv;
+    }
+  });
+
+  it("returns actual cwd when launched from a project directory", async () => {
+    const origCwd = process.cwd;
+    const origEnv = process.env.__COMPANION_PACKAGE_ROOT;
+    try {
+      process.env.__COMPANION_PACKAGE_ROOT = "/opt/companion";
+      process.cwd = () => "/Users/testuser/my-project";
+      const res = await app.request("/api/fs/home", { method: "GET" });
+      const json = await res.json();
+      expect(json.cwd).toBe("/Users/testuser/my-project");
+    } finally {
+      process.cwd = origCwd;
+      process.env.__COMPANION_PACKAGE_ROOT = origEnv;
+    }
+  });
+
+  it("returns home as cwd when process.cwd() equals home directory", async () => {
+    const { homedir } = await import("node:os");
+    const origCwd = process.cwd;
+    const origEnv = process.env.__COMPANION_PACKAGE_ROOT;
+    try {
+      delete process.env.__COMPANION_PACKAGE_ROOT;
+      process.cwd = () => homedir();
+      const res = await app.request("/api/fs/home", { method: "GET" });
+      const json = await res.json();
+      expect(json.cwd).toBe(json.home);
+    } finally {
+      process.cwd = origCwd;
+      process.env.__COMPANION_PACKAGE_ROOT = origEnv;
+    }
+  });
 });
 
 describe("GET /api/fs/diff", () => {
@@ -658,6 +1121,7 @@ describe("GET /api/fs/diff", () => {
   });
 
   it("returns unified diff for a file", async () => {
+    // Validates that /api/fs/diff uses the repository default branch as base (origin/main here).
     const diffOutput = `diff --git a/file.ts b/file.ts
 --- a/file.ts
 +++ b/file.ts
@@ -666,7 +1130,11 @@ describe("GET /api/fs/diff", () => {
 -old line
 +new line
  line3`;
-    vi.mocked(execSync).mockReturnValueOnce(diffOutput);
+    vi.mocked(execSync)
+      .mockReturnValueOnce("/repo\n") // rev-parse --show-toplevel
+      .mockReturnValueOnce("file.ts\n") // ls-files --full-name
+      .mockReturnValueOnce("refs/remotes/origin/main\n") // symbolic-ref refs/remotes/origin/HEAD
+      .mockReturnValueOnce(diffOutput); // git diff origin/main
 
     const res = await app.request("/api/fs/diff?path=/repo/file.ts", { method: "GET" });
 
@@ -675,7 +1143,70 @@ describe("GET /api/fs/diff", () => {
     expect(json.diff).toBe(diffOutput);
     expect(json.path).toContain("file.ts");
     expect(vi.mocked(execSync)).toHaveBeenCalledWith(
-      expect.stringContaining("git diff HEAD"),
+      expect.stringContaining("git diff origin/main"),
+      expect.objectContaining({ encoding: "utf-8", timeout: 5000 }),
+    );
+  });
+
+  it("returns no-index diff for untracked files", async () => {
+    // Untracked files have no base-branch diff content, so API must fallback to a full-file no-index diff.
+    const untrackedDiff = `diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..e69de29
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1 @@
++hello`;
+
+    vi.mocked(execSync)
+      .mockReturnValueOnce("/repo\n") // rev-parse --show-toplevel
+      .mockReturnValueOnce("new.txt\n") // ls-files --full-name
+      .mockReturnValueOnce("refs/remotes/origin/main\n") // symbolic-ref refs/remotes/origin/HEAD
+      .mockReturnValueOnce("") // git diff origin/main -> empty for untracked
+      .mockReturnValueOnce("new.txt\n") // ls-files --others --exclude-standard
+      .mockImplementationOnce(() => {
+        const err = new Error("diff exits with 1 for differences") as Error & { stdout: string };
+        err.stdout = untrackedDiff;
+        throw err;
+      }); // git diff --no-index
+
+    const res = await app.request("/api/fs/diff?path=/repo/new.txt", { method: "GET" });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.diff).toContain("new file mode");
+    expect(vi.mocked(execSync)).toHaveBeenCalledWith(
+      expect.stringContaining("git diff --no-index -- /dev/null"),
+      expect.objectContaining({ encoding: "utf-8", timeout: 5000 }),
+    );
+  });
+
+  it("falls back to local default branch when origin HEAD is unavailable", async () => {
+    // Ensures fallback chain works when symbolic-ref fails (e.g. no origin/HEAD): use local fallback branch.
+    const diffOutput = `diff --git a/file.ts b/file.ts
+--- a/file.ts
++++ b/file.ts
+@@ -1,2 +1,3 @@
+ line1
++added`;
+    vi.mocked(execSync)
+      .mockReturnValueOnce("/repo\n") // rev-parse --show-toplevel
+      .mockReturnValueOnce("file.ts\n") // ls-files --full-name
+      .mockImplementationOnce(() => {
+        const err = new Error("no symbol ref") as Error & { stdout: string };
+        err.stdout = "error: ref refs/remotes/origin/HEAD is not a symbolic ref";
+        throw err;
+      }) // symbolic-ref refs/remotes/origin/HEAD unavailable
+      .mockReturnValueOnce("main\n") // branch --list fallback
+      .mockReturnValueOnce(diffOutput); // git diff main
+
+    const res = await app.request("/api/fs/diff?path=/repo/file.ts", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.diff).toBe(diffOutput);
+    expect(vi.mocked(execSync)).toHaveBeenCalledWith(
+      expect.stringContaining("git diff main"),
       expect.objectContaining({ encoding: "utf-8", timeout: 5000 }),
     );
   });
@@ -691,5 +1222,224 @@ describe("GET /api/fs/diff", () => {
     const json = await res.json();
     expect(json.diff).toBe("");
     expect(json.path).toContain("file.ts");
+  });
+});
+
+// ─── Backends ─────────────────────────────────────────────────────────────────
+
+describe("GET /api/backends", () => {
+  it("returns both backends with availability status", async () => {
+    // resolveBinary returns a path for both binaries
+    mockResolveBinary
+      .mockReturnValueOnce("/usr/bin/claude")
+      .mockReturnValueOnce("/usr/bin/codex");
+
+    const res = await app.request("/api/backends", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual([
+      { id: "claude", name: "Claude Code", available: true },
+      { id: "codex", name: "Codex", available: true },
+    ]);
+  });
+
+  it("marks backends as unavailable when binary is not found", async () => {
+    // resolveBinary returns null for both
+    mockResolveBinary
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(null);
+
+    const res = await app.request("/api/backends", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual([
+      { id: "claude", name: "Claude Code", available: false },
+      { id: "codex", name: "Codex", available: false },
+    ]);
+  });
+
+  it("handles mixed availability", async () => {
+    mockResolveBinary
+      .mockReturnValueOnce("/usr/bin/claude") // claude found
+      .mockReturnValueOnce(null); // codex not found
+
+    const res = await app.request("/api/backends", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json[0].available).toBe(true);
+    expect(json[1].available).toBe(false);
+  });
+});
+
+describe("GET /api/backends/:id/models", () => {
+  it("returns codex models from cache file sorted by priority", async () => {
+    const cacheContent = JSON.stringify({
+      models: [
+        { slug: "gpt-5.1-codex-mini", display_name: "gpt-5.1-codex-mini", description: "Fast model", visibility: "list", priority: 10 },
+        { slug: "gpt-5.2-codex", display_name: "gpt-5.2-codex", description: "Frontier model", visibility: "list", priority: 0 },
+        { slug: "gpt-5-codex", display_name: "gpt-5-codex", description: "Old model", visibility: "hide", priority: 8 },
+      ],
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(cacheContent);
+
+    const res = await app.request("/api/backends/codex/models", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    // Should only include visible models, sorted by priority
+    expect(json).toEqual([
+      { value: "gpt-5.2-codex", label: "gpt-5.2-codex", description: "Frontier model" },
+      { value: "gpt-5.1-codex-mini", label: "gpt-5.1-codex-mini", description: "Fast model" },
+    ]);
+  });
+
+  it("returns 404 when codex cache file does not exist", async () => {
+    vi.mocked(existsSync).mockReturnValue(false);
+
+    const res = await app.request("/api/backends/codex/models", { method: "GET" });
+
+    expect(res.status).toBe(404);
+    const json = await res.json();
+    expect(json.error).toContain("Codex models cache not found");
+  });
+
+  it("returns 500 when cache file is malformed", async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue("not valid json{{{");
+
+    const res = await app.request("/api/backends/codex/models", { method: "GET" });
+
+    expect(res.status).toBe(500);
+    const json = await res.json();
+    expect(json.error).toContain("Failed to parse");
+  });
+
+  it("returns 404 for claude backend (uses frontend defaults)", async () => {
+    const res = await app.request("/api/backends/claude/models", { method: "GET" });
+
+    expect(res.status).toBe(404);
+  });
+});
+
+// ─── Session creation with backend type ──────────────────────────────────────
+
+describe("POST /api/sessions/create with backend", () => {
+  it("passes backendType codex to launcher", async () => {
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.2-codex", cwd: "/test", backend: "codex" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(launcher.launch).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "gpt-5.2-codex", backendType: "codex" }),
+    );
+  });
+
+  it("defaults to claude backend when not specified", async () => {
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(launcher.launch).toHaveBeenCalledWith(
+      expect.objectContaining({ backendType: "claude" }),
+    );
+  });
+});
+
+// ─── Per-session usage limits ─────────────────────────────────────────────────
+
+describe("GET /api/sessions/:id/usage-limits", () => {
+  it("returns Claude usage limits for a claude session", async () => {
+    bridge.getSession.mockReturnValue({ backendType: "claude" });
+    mockGetUsageLimits.mockResolvedValue({
+      five_hour: { utilization: 42, resets_at: "2025-01-01T12:00:00Z" },
+      seven_day: { utilization: 15, resets_at: null },
+      extra_usage: null,
+    });
+
+    const res = await app.request("/api/sessions/s1/usage-limits", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual({
+      five_hour: { utilization: 42, resets_at: "2025-01-01T12:00:00Z" },
+      seven_day: { utilization: 15, resets_at: null },
+      extra_usage: null,
+    });
+    expect(mockGetUsageLimits).toHaveBeenCalled();
+  });
+
+  it("returns mapped Codex rate limits for a codex session", async () => {
+    bridge.getSession.mockReturnValue({ backendType: "codex" });
+    bridge.getCodexRateLimits.mockReturnValue({
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1730947200 },
+      secondary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1731552000 },
+    });
+
+    const res = await app.request("/api/sessions/s1/usage-limits", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.five_hour).toEqual({
+      utilization: 25,
+      resets_at: new Date(1730947200 * 1000).toISOString(),
+    });
+    expect(json.seven_day).toEqual({
+      utilization: 10,
+      resets_at: new Date(1731552000 * 1000).toISOString(),
+    });
+    expect(json.extra_usage).toBeNull();
+    expect(mockGetUsageLimits).not.toHaveBeenCalled();
+  });
+
+  it("returns empty limits when codex session has no rate limits yet", async () => {
+    bridge.getSession.mockReturnValue({ backendType: "codex" });
+    bridge.getCodexRateLimits.mockReturnValue(null);
+
+    const res = await app.request("/api/sessions/s1/usage-limits", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual({ five_hour: null, seven_day: null, extra_usage: null });
+  });
+
+  it("handles codex rate limits with null secondary", async () => {
+    bridge.getSession.mockReturnValue({ backendType: "codex" });
+    bridge.getCodexRateLimits.mockReturnValue({
+      primary: { usedPercent: 50, windowDurationMins: 300, resetsAt: 0 },
+      secondary: null,
+    });
+
+    const res = await app.request("/api/sessions/s1/usage-limits", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.five_hour).toEqual({ utilization: 50, resets_at: null });
+    expect(json.seven_day).toBeNull();
+  });
+
+  it("falls back to Claude limits when session is not found", async () => {
+    bridge.getSession.mockReturnValue(null);
+    mockGetUsageLimits.mockResolvedValue({
+      five_hour: null,
+      seven_day: null,
+      extra_usage: null,
+    });
+
+    const res = await app.request("/api/sessions/unknown/usage-limits", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual({ five_hour: null, seven_day: null, extra_usage: null });
+    expect(mockGetUsageLimits).toHaveBeenCalled();
   });
 });

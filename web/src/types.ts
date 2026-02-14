@@ -4,9 +4,12 @@ import type {
   ContentBlock,
   BrowserIncomingMessage,
   BrowserOutgoingMessage,
+  BackendType,
+  McpServerDetail,
+  McpServerConfig,
 } from "../server/session-types.js";
 
-export type { SessionState, PermissionRequest, ContentBlock, BrowserIncomingMessage, BrowserOutgoingMessage };
+export type { SessionState, PermissionRequest, ContentBlock, BrowserIncomingMessage, BrowserOutgoingMessage, BackendType, McpServerDetail, McpServerConfig };
 
 export interface ChatMessage {
   id: string;
@@ -46,4 +49,10 @@ export interface SdkSessionInfo {
   branch?: string;
   actualBranch?: string;
   name?: string;
+  backendType?: BackendType;
+  gitBranch?: string;
+  gitAhead?: number;
+  gitBehind?: number;
+  totalLinesAdded?: number;
+  totalLinesRemoved?: number;
 }

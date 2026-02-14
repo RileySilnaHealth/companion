@@ -1,4 +1,14 @@
 // @vitest-environment jsdom
+const { captureEventMock, captureExceptionMock } = vi.hoisted(() => ({
+  captureEventMock: vi.fn(),
+  captureExceptionMock: vi.fn(),
+}));
+
+vi.mock("./analytics.js", () => ({
+  captureEvent: captureEventMock,
+  captureException: captureExceptionMock,
+}));
+
 import { api } from "./api.js";
 
 const mockFetch = vi.fn();
@@ -15,6 +25,8 @@ function mockResponse(data: unknown, status = 200) {
 
 beforeEach(() => {
   mockFetch.mockReset();
+  captureEventMock.mockReset();
+  captureExceptionMock.mockReset();
 });
 
 // ===========================================================================
@@ -34,6 +46,48 @@ describe("createSession", () => {
     expect(opts.headers["Content-Type"]).toBe("application/json");
     expect(JSON.parse(opts.body)).toEqual({ model: "opus", cwd: "/home" });
     expect(result).toEqual(responseData);
+  });
+
+  it("passes codexInternetAccess when provided", async () => {
+    const responseData = { sessionId: "s2", state: "starting", cwd: "/repo" };
+    mockFetch.mockResolvedValueOnce(mockResponse(responseData));
+
+    await api.createSession({
+      backend: "codex",
+      cwd: "/repo",
+      codexInternetAccess: true,
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    expect(JSON.parse(opts.body)).toEqual({
+      backend: "codex",
+      cwd: "/repo",
+      codexInternetAccess: true,
+    });
+  });
+
+  it("passes container options when provided", async () => {
+    const responseData = { sessionId: "s3", state: "starting", cwd: "/repo" };
+    mockFetch.mockResolvedValueOnce(mockResponse(responseData));
+
+    await api.createSession({
+      backend: "claude",
+      cwd: "/repo",
+      container: {
+        image: "companion-core:latest",
+        ports: [3000, 5173],
+      },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    expect(JSON.parse(opts.body)).toEqual({
+      backend: "claude",
+      cwd: "/repo",
+      container: {
+        image: "companion-core:latest",
+        ports: [3000, 5173],
+      },
+    });
   });
 });
 
@@ -93,6 +147,11 @@ describe("post() error handling", () => {
     mockFetch.mockResolvedValueOnce(mockResponse({ error: "Session not found" }, 404));
 
     await expect(api.killSession("nonexistent")).rejects.toThrow("Session not found");
+    expect(captureEventMock).toHaveBeenCalledWith(
+      "api_request_failed",
+      expect.objectContaining({ method: "POST", path: "/sessions/nonexistent/kill", status: 404 }),
+    );
+    expect(captureExceptionMock).toHaveBeenCalled();
   });
 
   it("falls back to statusText when JSON body has no error field", async () => {
@@ -115,6 +174,21 @@ describe("get() error handling", () => {
     });
 
     await expect(api.listSessions()).rejects.toThrow("Forbidden");
+    expect(captureEventMock).toHaveBeenCalledWith(
+      "api_request_failed",
+      expect.objectContaining({ method: "GET", path: "/sessions", status: 403 }),
+    );
+  });
+
+  it("captures network failures", async () => {
+    mockFetch.mockRejectedValueOnce(new Error("Network down"));
+
+    await expect(api.listSessions()).rejects.toThrow("Network down");
+    expect(captureEventMock).toHaveBeenCalledWith(
+      "api_request_failed",
+      expect.objectContaining({ method: "GET", path: "/sessions" }),
+    );
+    expect(captureExceptionMock).toHaveBeenCalled();
   });
 });
 
@@ -177,6 +251,34 @@ describe("updateEnv", () => {
 });
 
 // ===========================================================================
+// settings
+// ===========================================================================
+describe("settings", () => {
+  it("sends GET to /api/settings", async () => {
+    const settings = { openrouterApiKeyConfigured: true, openrouterModel: "openrouter/free" };
+    mockFetch.mockResolvedValueOnce(mockResponse(settings));
+
+    const result = await api.getSettings();
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/settings");
+    expect(result).toEqual(settings);
+  });
+
+  it("sends PUT to /api/settings", async () => {
+    const settings = { openrouterApiKeyConfigured: true, openrouterModel: "openrouter/free" };
+    mockFetch.mockResolvedValueOnce(mockResponse(settings));
+
+    await api.updateSettings({ openrouterApiKey: "or-key" });
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/settings");
+    expect(opts.method).toBe("PUT");
+    expect(JSON.parse(opts.body)).toEqual({ openrouterApiKey: "or-key" });
+  });
+});
+
+// ===========================================================================
 // getRepoInfo
 // ===========================================================================
 describe("getRepoInfo", () => {
@@ -222,5 +324,50 @@ describe("getFileDiff", () => {
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe(`/api/fs/diff?path=${encodeURIComponent("/repo/file.ts")}`);
     expect(result).toEqual(diffData);
+  });
+});
+
+// ===========================================================================
+// getSessionUsageLimits
+// ===========================================================================
+describe("getSessionUsageLimits", () => {
+  it("sends GET to /api/sessions/:id/usage-limits", async () => {
+    const limitsData = {
+      five_hour: { utilization: 25, resets_at: "2026-01-01T12:00:00Z" },
+      seven_day: null,
+      extra_usage: null,
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse(limitsData));
+
+    const result = await api.getSessionUsageLimits("sess-123");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sessions/sess-123/usage-limits");
+    expect(result).toEqual(limitsData);
+  });
+});
+
+// ===========================================================================
+// getCloudProviderPlan
+// ===========================================================================
+describe("getCloudProviderPlan", () => {
+  it("sends GET with provider/cwd/sessionId query params", async () => {
+    const plan = {
+      provider: "modal",
+      sessionId: "s1",
+      image: "companion-core:latest",
+      cwd: "/repo",
+      mappedPorts: [{ containerPort: 3000, hostPort: 49152 }],
+      commandPreview: "modal run companion_cloud.py --manifest /repo/.companion/cloud/environments/s1.json",
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse(plan));
+
+    const result = await api.getCloudProviderPlan("modal", "/repo", "s1");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe(
+      `/api/cloud/providers/modal/plan?cwd=${encodeURIComponent("/repo")}&sessionId=${encodeURIComponent("s1")}`,
+    );
+    expect(result).toEqual(plan);
   });
 });

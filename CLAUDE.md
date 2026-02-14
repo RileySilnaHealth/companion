@@ -1,10 +1,11 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code & Codex when working with code in this repository.
 
 ## What This Is
 
-The Vibe Companion — a web UI for Claude Code. It reverse-engineers the undocumented `--sdk-url` WebSocket protocol in the Claude Code CLI to provide a browser-based interface for running multiple Claude Code sessions with streaming, tool call visibility, and permission control.
+The Companion — a web UI for Claude Code & Codex. 
+It reverse-engineers the undocumented `--sdk-url` WebSocket protocol in the Claude Code CLI to provide a browser-based interface for running multiple Claude Code sessions with streaming, tool call visibility, and permission control.
 
 ## Development Commands
 
@@ -20,6 +21,11 @@ cd web && bun run typecheck
 
 # Production build + serve
 cd web && bun run build && bun run start
+
+# Landing page (thecompanion.sh) — idempotent: starts if down, no-op if up
+# IMPORTANT: Always use this script to run the landing page. Never cd into landing/ and run bun/vite manually.
+./scripts/landing-start.sh          # start
+./scripts/landing-start.sh --stop   # stop
 ```
 
 ## Testing
@@ -36,6 +42,11 @@ cd web && bun run test:watch
 - Tests use Vitest. Server tests live alongside source files (e.g. `routes.test.ts` next to `routes.ts`).
 - A husky pre-commit hook runs typecheck and tests automatically before each commit.
 - **Never remove or delete existing tests.** If a test is failing, fix the code or the test. If you believe a test should be removed, you must first explain to the user why and get explicit approval before removing it.
+- When creating test, make sure to document what the test is validating, and any important context or edge cases in comments within the test code.
+
+## Component Playground
+
+All UI components used in the message/chat flow **must** be represented in the Playground page (`web/src/components/Playground.tsx`, accessible at `#/playground`). When adding or modifying a message-related component (e.g. `MessageBubble`, `ToolBlock`, `PermissionBanner`, `Composer`, streaming indicators, tool groups, subagent groups), update the Playground to include a mock of the new or changed state.
 
 ## Architecture
 
@@ -71,7 +82,7 @@ Browser (React) ←→ WebSocket ←→ Hono Server (Bun) ←→ WebSocket (NDJS
   - `App.tsx` — Root layout with sidebar, chat view, task panel. Hash routing (`#/playground`).
   - `components/` — UI: `ChatView`, `MessageFeed`, `MessageBubble`, `ToolBlock`, `Composer`, `Sidebar`, `TopBar`, `HomePage`, `TaskPanel`, `PermissionBanner`, `EnvManager`, `Playground`.
 
-- **`web/bin/cli.ts`** — CLI entry point (`bunx the-vibe-companion`). Sets `__VIBE_PACKAGE_ROOT` and imports the server.
+- **`web/bin/cli.ts`** — CLI entry point (`bunx the-companion`). Sets `__COMPANION_PACKAGE_ROOT` and imports the server.
 
 ### WebSocket Protocol
 
@@ -94,3 +105,47 @@ When submitting a pull request:
 - Add a screenshot of the changes in the PR description if its a visual change
 - Explain simply what the PR does and why it's needed
 - Tell me if the code was reviewed by a human or simply generated directly by an AI. 
+
+### How To Open A PR With GitHub CLI
+
+Use this flow from the repository root:
+
+```bash
+# 1) Create a branch
+git checkout -b fix/short-description (commitzen)
+
+# 2) Commit using commitzen format
+git add <files>
+git commit -m "fix(scope): short summary" (commitzen)
+
+# 3) Push and set upstream
+git push -u origin fix/short-description
+
+# 4) Create PR (title should follow commitzen style)
+gh pr create --base main --head fix/short-description --title "fix(scope): short summary"
+```
+
+For multi-line PR descriptions, prefer a body file to avoid shell quoting issues:
+
+```bash
+cat > /tmp/pr_body.md <<'EOF'
+## Summary
+- what changed
+
+## Why
+- why this is needed
+
+## Testing
+- what was run
+
+## Review provenance
+- Implemented by AI agent / Human
+- Human review: yes/no
+EOF
+
+gh pr edit --body-file /tmp/pr_body.md
+```
+
+## Codex & Claude Code
+- All features must be compatible with both Codex and Claude Code. If a feature is only compatible with one, it must be gated behind a clear UI affordance (e.g. "This feature requires Claude Code") and the incompatible option should be hidden or disabled.
+- When implementing a new feature, always consider how it will work with both models and test with both if possible. If a feature is only implemented for one model, document that clearly in the code and in the UI.

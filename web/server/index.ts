@@ -1,5 +1,11 @@
 process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1";
 
+// Enrich process PATH at startup so binary resolution and `which` calls can find
+// binaries installed via version managers (nvm, volta, fnm, etc.).
+// Critical when running as a launchd/systemd service with a restricted PATH.
+import { getEnrichedPath } from "./path-resolver.js";
+process.env.PATH = getEnrichedPath();
+
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
@@ -10,19 +16,29 @@ import { CliLauncher } from "./cli-launcher.js";
 import { WsBridge } from "./ws-bridge.js";
 import { SessionStore } from "./session-store.js";
 import { WorktreeTracker } from "./worktree-tracker.js";
+import { TerminalManager } from "./terminal-manager.js";
 import { generateSessionTitle } from "./auto-namer.js";
 import * as sessionNames from "./session-names.js";
+import { getSettings } from "./settings-manager.js";
+import { PRPoller } from "./pr-poller.js";
+import { startPeriodicCheck, setServiceMode } from "./update-checker.js";
+import { isRunningAsService } from "./service.js";
 import type { SocketData } from "./ws-bridge.js";
 import type { ServerWebSocket } from "bun";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const packageRoot = process.env.__VIBE_PACKAGE_ROOT || resolve(__dirname, "..");
+const packageRoot = process.env.__COMPANION_PACKAGE_ROOT || resolve(__dirname, "..");
 
-const port = Number(process.env.PORT) || 3456;
+import { DEFAULT_PORT_DEV, DEFAULT_PORT_PROD } from "./constants.js";
+
+const defaultPort = process.env.NODE_ENV === "production" ? DEFAULT_PORT_PROD : DEFAULT_PORT_DEV;
+const port = Number(process.env.PORT) || defaultPort;
 const sessionStore = new SessionStore();
 const wsBridge = new WsBridge();
 const launcher = new CliLauncher(port);
 const worktreeTracker = new WorktreeTracker();
+const terminalManager = new TerminalManager();
+const prPoller = new PRPoller(wsBridge);
 
 // ── Restore persisted sessions from disk ────────────────────────────────────
 wsBridge.setStore(sessionStore);
@@ -33,6 +49,16 @@ wsBridge.restoreFromDisk();
 // When the CLI reports its internal session_id, store it for --resume on relaunch
 wsBridge.onCLISessionIdReceived((sessionId, cliSessionId) => {
   launcher.setCLISessionId(sessionId, cliSessionId);
+});
+
+// When a Codex adapter is created, attach it to the WsBridge
+launcher.onCodexAdapterCreated((sessionId, adapter) => {
+  wsBridge.attachCodexAdapter(sessionId, adapter);
+});
+
+// Start watching PRs when git info is resolved for a session
+wsBridge.onSessionGitInfoReadyCallback((sessionId, cwd, branch) => {
+  prPoller.watch(sessionId, cwd, branch);
 });
 
 // Auto-relaunch CLI when a browser connects to a session with no CLI
@@ -56,9 +82,10 @@ wsBridge.onCLIRelaunchNeededCallback(async (sessionId) => {
 wsBridge.onFirstTurnCompletedCallback(async (sessionId, firstUserMessage) => {
   // Don't overwrite a name that was already set (manual rename or prior auto-name)
   if (sessionNames.getName(sessionId)) return;
+  if (!getSettings().openrouterApiKey.trim()) return;
   const info = launcher.getSession(sessionId);
   const model = info?.model || "claude-sonnet-4-5-20250929";
-  console.log(`[server] Auto-naming session ${sessionId} with model ${model}...`);
+  console.log(`[server] Auto-naming session ${sessionId} via OpenRouter with model ${model}...`);
   const title = await generateSessionTitle(firstUserMessage, model);
   // Re-check: a manual rename may have occurred while we were generating
   if (title && !sessionNames.getName(sessionId)) {
@@ -73,7 +100,7 @@ console.log(`[server] Session persistence: ${sessionStore.directory}`);
 const app = new Hono();
 
 app.use("/api/*", cors());
-app.route("/api", createRoutes(launcher, wsBridge, sessionStore, worktreeTracker));
+app.route("/api", createRoutes(launcher, wsBridge, sessionStore, worktreeTracker, terminalManager, prPoller));
 
 // In production, serve built frontend using absolute path (works when installed as npm package)
 if (process.env.NODE_ENV === "production") {
@@ -109,6 +136,17 @@ const server = Bun.serve<SocketData>({
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
+    // ── Terminal WebSocket — embedded terminal PTY connection ─────────
+    const termMatch = url.pathname.match(/^\/ws\/terminal\/([a-f0-9-]+)$/);
+    if (termMatch) {
+      const terminalId = termMatch[1];
+      const upgraded = server.upgrade(req, {
+        data: { kind: "terminal" as const, terminalId },
+      });
+      if (upgraded) return undefined;
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
+
     // Hono handles the rest
     return app.fetch(req, server);
   },
@@ -120,6 +158,8 @@ const server = Bun.serve<SocketData>({
         launcher.markConnected(data.sessionId);
       } else if (data.kind === "browser") {
         wsBridge.handleBrowserOpen(ws, data.sessionId);
+      } else if (data.kind === "terminal") {
+        terminalManager.addBrowserSocket(ws);
       }
     },
     message(ws: ServerWebSocket<SocketData>, msg: string | Buffer) {
@@ -128,6 +168,8 @@ const server = Bun.serve<SocketData>({
         wsBridge.handleCLIMessage(ws, msg);
       } else if (data.kind === "browser") {
         wsBridge.handleBrowserMessage(ws, msg);
+      } else if (data.kind === "terminal") {
+        terminalManager.handleBrowserMessage(ws, msg);
       }
     },
     close(ws: ServerWebSocket<SocketData>) {
@@ -136,6 +178,8 @@ const server = Bun.serve<SocketData>({
         wsBridge.handleCLIClose(ws);
       } else if (data.kind === "browser") {
         wsBridge.handleBrowserClose(ws);
+      } else if (data.kind === "terminal") {
+        terminalManager.removeBrowserSocket(ws);
       }
     },
   },
@@ -147,6 +191,13 @@ console.log(`  Browser WebSocket: ws://localhost:${server.port}/ws/browser/:sess
 
 if (process.env.NODE_ENV !== "production") {
   console.log("Dev mode: frontend at http://localhost:5174");
+}
+
+// ── Update checker ──────────────────────────────────────────────────────────
+startPeriodicCheck();
+if (isRunningAsService()) {
+  setServiceMode(true);
+  console.log("[server] Running as background service (auto-update available)");
 }
 
 // ── Reconnection watchdog ────────────────────────────────────────────────────

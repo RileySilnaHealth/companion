@@ -1,10 +1,12 @@
 import { useState, useRef, useEffect } from "react";
 import { useStore } from "../store.js";
-import { api, type CompanionEnv, type GitRepoInfo, type GitBranchInfo } from "../api.js";
+import { api, type CompanionEnv, type GitRepoInfo, type GitBranchInfo, type BackendInfo } from "../api.js";
 import { connectSession, waitForConnection, sendToSession } from "../ws.js";
 import { disconnectSession } from "../ws.js";
 import { generateUniqueSessionName } from "../utils/names.js";
 import { getRecentDirs, addRecentDir } from "../utils/recent-dirs.js";
+import { getModelsForBackend, getModesForBackend, getDefaultModel, getDefaultMode, toModelOptions, type ModelOption } from "../utils/backends.js";
+import type { BackendType } from "../types.js";
 import { EnvManager } from "./EnvManager.js";
 import { FolderPicker } from "./FolderPicker.js";
 
@@ -27,27 +29,31 @@ function readFileAsBase64(file: File): Promise<{ base64: string; mediaType: stri
   });
 }
 
-const MODELS = [
-  { value: "claude-opus-4-6", label: "Opus", icon: "\u2733" },
-  { value: "claude-sonnet-4-5-20250929", label: "Sonnet", icon: "\u25D0" },
-  { value: "claude-haiku-4-5-20251001", label: "Haiku", icon: "\u26A1" },
-];
-
-const MODES = [
-  { value: "bypassPermissions", label: "Agent" },
-  { value: "plan", label: "Plan" },
-];
-
 let idCounter = 0;
 
 export function HomePage() {
   const [text, setText] = useState("");
-  const [model, setModel] = useState(MODELS[0].value);
-  const [mode, setMode] = useState(MODES[0].value);
+  const [backend, setBackend] = useState<BackendType>(() =>
+    (localStorage.getItem("cc-backend") as BackendType) || "claude",
+  );
+  const [backends, setBackends] = useState<BackendInfo[]>([]);
+  const [model, setModel] = useState(() => getDefaultModel(
+    (localStorage.getItem("cc-backend") as BackendType) || "claude",
+  ));
+  const [mode, setMode] = useState(() => getDefaultMode(
+    (localStorage.getItem("cc-backend") as BackendType) || "claude",
+  ));
   const [cwd, setCwd] = useState(() => getRecentDirs()[0] || "");
   const [images, setImages] = useState<ImageAttachment[]>([]);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [dynamicModels, setDynamicModels] = useState<ModelOption[] | null>(null);
+  const [codexInternetAccess, setCodexInternetAccess] = useState(() =>
+    localStorage.getItem("cc-codex-internet-access") === "1",
+  );
+
+  const MODELS = dynamicModels || getModelsForBackend(backend);
+  const MODES = getModesForBackend(backend);
 
   // Environment state
   const [envs, setEnvs] = useState<CompanionEnv[]>([]);
@@ -71,6 +77,11 @@ export function HomePage() {
   const [branchFilter, setBranchFilter] = useState("");
   const [isNewBranch, setIsNewBranch] = useState(false);
 
+  // Branch freshness check state
+  const [pullPrompt, setPullPrompt] = useState<{ behind: number; branchName: string } | null>(null);
+  const [pulling, setPulling] = useState(false);
+  const [pullError, setPullError] = useState("");
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
@@ -80,12 +91,15 @@ export function HomePage() {
   const setCurrentSession = useStore((s) => s.setCurrentSession);
   const currentSessionId = useStore((s) => s.currentSessionId);
 
-  // Auto-focus textarea
+  // Auto-focus textarea (desktop only — on mobile it triggers the keyboard immediately)
   useEffect(() => {
-    textareaRef.current?.focus();
+    const isDesktop = window.matchMedia("(min-width: 640px)").matches;
+    if (isDesktop) {
+      textareaRef.current?.focus();
+    }
   }, []);
 
-  // Load server home/cwd on mount
+  // Load server home/cwd and available backends on mount
   useEffect(() => {
     api.getHome().then(({ home, cwd: serverCwd }) => {
       if (!cwd) {
@@ -93,7 +107,37 @@ export function HomePage() {
       }
     }).catch(() => {});
     api.listEnvs().then(setEnvs).catch(() => {});
+    api.getBackends().then(setBackends).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When backend changes, reset model and mode to defaults
+  function switchBackend(newBackend: BackendType) {
+    setBackend(newBackend);
+    localStorage.setItem("cc-backend", newBackend);
+    setDynamicModels(null);
+    setModel(getDefaultModel(newBackend));
+    setMode(getDefaultMode(newBackend));
+  }
+
+  // Fetch dynamic models for the selected backend
+  useEffect(() => {
+    if (backend !== "codex") {
+      setDynamicModels(null);
+      return;
+    }
+    api.getBackendModels(backend).then((models) => {
+      if (models.length > 0) {
+        const options = toModelOptions(models);
+        setDynamicModels(options);
+        // If current model isn't in the list, switch to first
+        if (!options.some((m) => m.value === model)) {
+          setModel(options[0].value);
+        }
+      }
+    }).catch(() => {
+      // Fall back to hardcoded models silently
+    });
+  }, [backend]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -111,8 +155,8 @@ export function HomePage() {
         setShowBranchDropdown(false);
       }
     }
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
+    document.addEventListener("pointerdown", handleClick);
+    return () => document.removeEventListener("pointerdown", handleClick);
   }, []);
 
   // Detect git repo when cwd changes
@@ -142,6 +186,7 @@ export function HomePage() {
 
   const selectedModel = MODELS.find((m) => m.value === model) || MODELS[0];
   const selectedMode = MODES.find((m) => m.value === mode) || MODES[0];
+  const logoSrc = backend === "codex" ? "/logo-codex.svg" : "/logo.svg";
   const dirLabel = cwd ? cwd.split("/").pop() || cwd : "Select folder";
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
@@ -188,7 +233,10 @@ export function HomePage() {
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === "Tab" && e.shiftKey) {
       e.preventDefault();
-      setMode(mode === "plan" ? "bypassPermissions" : "plan");
+      const currentModes = getModesForBackend(backend);
+      const currentIndex = currentModes.findIndex((m) => m.value === mode);
+      const nextIndex = (currentIndex + 1) % currentModes.length;
+      setMode(currentModes[nextIndex].value);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -203,6 +251,30 @@ export function HomePage() {
 
     setSending(true);
     setError("");
+    setPullError("");
+
+    // Branch freshness check: warn if behind remote
+    // Only offer pull when the effective branch is the currently checked-out branch,
+    // since git pull operates on the checked-out branch
+    if (gitRepoInfo) {
+      const effectiveBranch = useWorktree ? worktreeBranch : gitRepoInfo.currentBranch;
+      if (effectiveBranch && effectiveBranch === gitRepoInfo.currentBranch) {
+        const branchInfo = branches.find(b => b.name === effectiveBranch && !b.isRemote);
+        if (branchInfo && branchInfo.behind > 0) {
+          setPullPrompt({ behind: branchInfo.behind, branchName: effectiveBranch });
+          return; // Pause — user must choose pull/skip/cancel
+        }
+      }
+    }
+
+    await doCreateSession(msg);
+  }
+
+  async function doCreateSession(msg: string) {
+    if (!msg) {
+      setSending(false);
+      return;
+    }
 
     try {
       // Disconnect current session if any
@@ -220,6 +292,8 @@ export function HomePage() {
         branch: branchName,
         createBranch: branchName && isNewBranch ? true : undefined,
         useWorktree: useWorktree || undefined,
+        backend,
+        codexInternetAccess: backend === "codex" ? codexInternetAccess : undefined,
       });
       const sessionId = result.sessionId;
 
@@ -263,16 +337,60 @@ export function HomePage() {
     }
   }
 
+  async function handlePullAndContinue() {
+    if (!pullPrompt) return;
+    setPulling(true);
+    setPullError("");
+
+    try {
+      const pullCwd = cwd || gitRepoInfo?.repoRoot;
+      if (!pullCwd) throw new Error("No working directory");
+
+      const result = await api.gitPull(pullCwd);
+      if (!result.success) {
+        setPullError(result.output || "Pull failed");
+        setPulling(false);
+        setSending(false);
+        return;
+      }
+
+      // Refresh branch data after successful pull
+      if (gitRepoInfo) {
+        api.listBranches(gitRepoInfo.repoRoot).then(setBranches).catch(() => {});
+      }
+
+      setPullPrompt(null);
+      setPulling(false);
+      await doCreateSession(text.trim());
+    } catch (e: unknown) {
+      setPullError(e instanceof Error ? e.message : String(e));
+      setPulling(false);
+    }
+  }
+
+  function handleSkipPull() {
+    const msg = text.trim();
+    setPullPrompt(null);
+    setPullError("");
+    doCreateSession(msg);
+  }
+
+  function handleCancelPull() {
+    setPullPrompt(null);
+    setPullError("");
+    setSending(false);
+  }
+
   const canSend = text.trim().length > 0 && !sending;
 
   return (
-    <div className="flex-1 h-full flex items-center justify-center px-3 sm:px-4">
+    <div className="flex-1 h-full flex items-start justify-center px-3 sm:px-4 pt-[15vh] sm:pt-[20vh] overflow-y-auto">
       <div className="w-full max-w-2xl">
         {/* Logo + Title */}
         <div className="flex flex-col items-center justify-center mb-4 sm:mb-6">
-          <img src="/logo.svg" alt="The Vibe Companion" className="w-24 h-24 sm:w-32 sm:h-32 mb-3" />
+          <img src={logoSrc} alt="The Companion" className="w-24 h-24 sm:w-32 sm:h-32 mb-3" />
           <h1 className="text-xl sm:text-2xl font-semibold text-cc-fg">
-            The Vibe Companion
+            The Companion
           </h1>
         </div>
 
@@ -319,7 +437,7 @@ export function HomePage() {
             onPaste={handlePaste}
             placeholder="Fix a bug, build a feature, refactor code..."
             rows={4}
-            className="w-full px-4 pt-4 pb-2 text-sm bg-transparent resize-none focus:outline-none text-cc-fg font-sans-ui placeholder:text-cc-muted"
+            className="w-full px-4 pt-4 pb-2 text-base sm:text-sm bg-transparent resize-none focus:outline-none text-cc-fg font-sans-ui placeholder:text-cc-muted"
             style={{ minHeight: "100px", maxHeight: "300px" }}
           />
 
@@ -391,7 +509,58 @@ export function HomePage() {
         </div>
 
         {/* Below-card selectors */}
-        <div className="flex items-center gap-1 sm:gap-2 mt-2 sm:mt-3 px-1 flex-wrap overflow-x-auto">
+        <div className="flex items-center gap-1 sm:gap-2 mt-2 sm:mt-3 px-1 flex-wrap">
+          {/* Backend toggle */}
+          {backends.length > 1 && (
+            <div className="flex items-center bg-cc-hover/50 rounded-lg p-0.5">
+              {backends.map((b) => (
+                <button
+                  key={b.id}
+                  onClick={() => b.available && switchBackend(b.id as BackendType)}
+                  disabled={!b.available}
+                  title={b.available ? b.name : `${b.name} CLI not found in PATH`}
+                  className={`flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors ${
+                    !b.available
+                      ? "text-cc-muted/40 cursor-not-allowed"
+                      : backend === b.id
+                        ? "bg-cc-card text-cc-fg font-medium shadow-sm cursor-pointer"
+                        : "text-cc-muted hover:text-cc-fg cursor-pointer"
+                  }`}
+                >
+                  {b.name}
+                  {!b.available && (
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3 text-cc-error/60">
+                      <circle cx="8" cy="8" r="6" />
+                      <path d="M5.5 5.5l5 5M10.5 5.5l-5 5" />
+                    </svg>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Codex internet access toggle */}
+          {backend === "codex" && (
+            <button
+              onClick={() => {
+                const next = !codexInternetAccess;
+                setCodexInternetAccess(next);
+                localStorage.setItem("cc-codex-internet-access", next ? "1" : "0");
+              }}
+              className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors cursor-pointer ${
+                codexInternetAccess
+                  ? "bg-cc-primary/15 text-cc-primary font-medium"
+                  : "text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
+              }`}
+              title="Allow Codex internet/network access for this session"
+            >
+              <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-70">
+                <path d="M8 2a6 6 0 100 12A6 6 0 008 2zm0 1.5c.8 0 1.55.22 2.2.61-.39.54-.72 1.21-.95 1.98H6.75c-.23-.77-.56-1.44-.95-1.98A4.47 4.47 0 018 3.5zm-3.2 1.3c.3.4.57.86.78 1.37H3.83c.24-.53.57-1.01.97-1.37zm-.97 2.87h2.15c.07.44.12.9.12 1.38 0 .48-.05.94-.12 1.38H3.83A4.56 4.56 0 013.5 9c0-.47.12-.92.33-1.33zm2.03 4.08c.39-.54.72-1.21.95-1.98h2.38c.23.77.56 1.44.95 1.98A4.47 4.47 0 018 12.5c-.8 0-1.55-.22-2.2-.61zm4.34-1.37c.07-.44.12-.9.12-1.38 0-.48-.05-.94-.12-1.38h2.15c.21.41.33.86.33 1.33 0 .47-.12.92-.33 1.33H10.2zm1.37-3.58h-1.75c-.21-.51-.48-.97-.78-1.37.4.36.73.84.97 1.37z" />
+              </svg>
+              <span>Internet</span>
+            </button>
+          )}
+
           {/* Folder selector */}
           <div>
             <button
@@ -451,7 +620,7 @@ export function HomePage() {
                       value={branchFilter}
                       onChange={(e) => setBranchFilter(e.target.value)}
                       placeholder="Filter or create branch..."
-                      className="w-full px-2 py-1 text-xs bg-cc-input-bg border border-cc-border rounded-md text-cc-fg font-mono-code placeholder:text-cc-muted focus:outline-none focus:border-cc-primary/50"
+                      className="w-full px-2 py-1 text-base sm:text-xs bg-cc-input-bg border border-cc-border rounded-md text-cc-fg font-mono-code placeholder:text-cc-muted focus:outline-none focus:border-cc-primary/50"
                       autoFocus
                       onKeyDown={(e) => {
                         if (e.key === "Escape") {
@@ -489,6 +658,12 @@ export function HomePage() {
                                 >
                                   <span className="truncate font-mono-code">{b.name}</span>
                                   <span className="ml-auto flex items-center gap-1.5 shrink-0">
+                                    {b.ahead > 0 && (
+                                      <span className="text-[9px] text-green-500">{b.ahead}&#8593;</span>
+                                    )}
+                                    {b.behind > 0 && (
+                                      <span className="text-[9px] text-amber-500">{b.behind}&#8595;</span>
+                                    )}
                                     {b.isCurrent && (
                                       <span className="text-[9px] px-1 py-0.5 rounded bg-green-500/15 text-green-600 dark:text-green-400">current</span>
                                     )}
@@ -652,7 +827,7 @@ export function HomePage() {
               </svg>
             </button>
             {showModelDropdown && (
-              <div className="absolute left-0 bottom-full mb-1 w-44 bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-10 py-1 overflow-hidden">
+              <div className="absolute left-0 bottom-full mb-1 w-48 bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-10 py-1">
                 {MODELS.map((m) => (
                   <button
                     key={m.value}
@@ -669,6 +844,59 @@ export function HomePage() {
             )}
           </div>
         </div>
+
+        {/* Branch behind remote warning */}
+        {pullPrompt && (
+          <div className="mt-3 p-3 rounded-[10px] bg-amber-500/10 border border-amber-500/20">
+            <div className="flex items-start gap-2.5">
+              <svg viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4 text-amber-500 shrink-0 mt-0.5">
+                <path d="M8.982 1.566a1.13 1.13 0 00-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 01-1.1 0L7.1 5.995A.905.905 0 018 5zm.002 6a1 1 0 110 2 1 1 0 010-2z" />
+              </svg>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-cc-fg leading-snug">
+                  <span className="font-mono-code font-medium">{pullPrompt.branchName}</span> is{" "}
+                  <span className="font-semibold text-amber-500">{pullPrompt.behind} commit{pullPrompt.behind !== 1 ? "s" : ""} behind</span>{" "}
+                  remote. Pull before starting?
+                </p>
+                {pullError && (
+                  <div className="mt-2 px-2 py-1.5 rounded-md bg-cc-error/10 border border-cc-error/20 text-[11px] text-cc-error font-mono-code whitespace-pre-wrap">
+                    {pullError}
+                  </div>
+                )}
+                <div className="flex gap-2 mt-2.5">
+                  <button
+                    onClick={handleCancelPull}
+                    disabled={pulling}
+                    className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-cc-hover text-cc-muted hover:text-cc-fg transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSkipPull}
+                    disabled={pulling}
+                    className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-cc-hover text-cc-muted hover:text-cc-fg transition-colors cursor-pointer"
+                  >
+                    Continue anyway
+                  </button>
+                  <button
+                    onClick={handlePullAndContinue}
+                    disabled={pulling}
+                    className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-cc-primary/15 text-cc-primary hover:bg-cc-primary/25 transition-colors cursor-pointer flex items-center gap-1.5"
+                  >
+                    {pulling ? (
+                      <>
+                        <span className="w-3 h-3 border-2 border-cc-primary/30 border-t-cc-primary rounded-full animate-spin" />
+                        Pulling...
+                      </>
+                    ) : (
+                      "Pull and continue"
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Error message */}
         {error && (

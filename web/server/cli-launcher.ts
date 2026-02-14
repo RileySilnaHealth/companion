@@ -1,9 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { execSync } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  copyFileSync,
+  cpSync,
+  realpathSync,
+} from "node:fs";
+import { join, resolve } from "node:path";
 import type { Subprocess } from "bun";
 import type { SessionStore } from "./session-store.js";
+import type { BackendType } from "./session-types.js";
+import { CodexAdapter } from "./codex-adapter.js";
+import { resolveBinary, getEnrichedPath } from "./path-resolver.js";
+import {
+  getLegacyCodexHome,
+  resolveCompanionCodexSessionHome,
+} from "./codex-home.js";
 
 export interface SdkSessionInfo {
   sessionId: string;
@@ -27,6 +41,22 @@ export interface SdkSessionInfo {
   actualBranch?: string;
   /** User-facing session name */
   name?: string;
+  /** Which backend this session uses */
+  backendType?: BackendType;
+  /** Git branch from bridge state (enriched by REST API) */
+  gitBranch?: string;
+  /** Git ahead count (enriched by REST API) */
+  gitAhead?: number;
+  /** Git behind count (enriched by REST API) */
+  gitBehind?: number;
+  /** Total lines added (enriched by REST API) */
+  totalLinesAdded?: number;
+  /** Total lines removed (enriched by REST API) */
+  totalLinesRemoved?: number;
+  /** Whether internet/web search is enabled for Codex sessions */
+  codexInternetAccess?: boolean;
+  /** Sandbox mode selected for Codex sessions */
+  codexSandbox?: "workspace-write" | "danger-full-access";
 }
 
 export interface LaunchOptions {
@@ -34,8 +64,16 @@ export interface LaunchOptions {
   permissionMode?: string;
   cwd?: string;
   claudeBinary?: string;
+  codexBinary?: string;
   allowedTools?: string[];
   env?: Record<string, string>;
+  backendType?: BackendType;
+  /** Codex sandbox mode. */
+  codexSandbox?: "workspace-write" | "danger-full-access";
+  /** Whether Codex internet/web search should be enabled for this session. */
+  codexInternetAccess?: boolean;
+  /** Optional override for CODEX_HOME used by Codex sessions. */
+  codexHome?: string;
   /** Pre-resolved worktree info from the session creation flow */
   worktreeInfo?: {
     isWorktree: boolean;
@@ -47,17 +85,23 @@ export interface LaunchOptions {
 }
 
 /**
- * Manages Claude Code CLI processes launched with --sdk-url.
- * Each session spawns a CLI that connects back to our WebSocket server.
+ * Manages CLI backend processes (Claude Code via --sdk-url WebSocket,
+ * or Codex via app-server stdio).
  */
 export class CliLauncher {
   private sessions = new Map<string, SdkSessionInfo>();
   private processes = new Map<string, Subprocess>();
   private port: number;
   private store: SessionStore | null = null;
+  private onCodexAdapter: ((sessionId: string, adapter: CodexAdapter) => void) | null = null;
 
   constructor(port: number) {
     this.port = port;
+  }
+
+  /** Register a callback for when a CodexAdapter is created (WsBridge needs to attach it). */
+  onCodexAdapterCreated(cb: (sessionId: string, adapter: CodexAdapter) => void): void {
+    this.onCodexAdapter = cb;
   }
 
   /** Attach a persistent store for surviving server restarts. */
@@ -110,12 +154,12 @@ export class CliLauncher {
   }
 
   /**
-   * Launch a new Claude Code CLI session.
-   * The CLI will connect back to ws://localhost:{port}/ws/cli/{sessionId}
+   * Launch a new CLI session (Claude Code or Codex).
    */
   launch(options: LaunchOptions = {}): SdkSessionInfo {
     const sessionId = randomUUID();
     const cwd = options.cwd || process.cwd();
+    const backendType = options.backendType || "claude";
 
     const info: SdkSessionInfo = {
       sessionId,
@@ -124,7 +168,13 @@ export class CliLauncher {
       permissionMode: options.permissionMode,
       cwd,
       createdAt: Date.now(),
+      backendType,
     };
+
+    if (backendType === "codex") {
+      info.codexInternetAccess = options.codexInternetAccess === true;
+      info.codexSandbox = options.codexSandbox;
+    }
 
     // Store worktree metadata if provided
     if (options.worktreeInfo) {
@@ -135,7 +185,12 @@ export class CliLauncher {
     }
 
     this.sessions.set(sessionId, info);
-    this.spawnCLI(sessionId, info, options);
+
+    if (backendType === "codex") {
+      this.spawnCodex(sessionId, info, options);
+    } else {
+      this.spawnCLI(sessionId, info, options);
+    }
     return info;
   }
 
@@ -165,12 +220,23 @@ export class CliLauncher {
     }
 
     info.state = "starting";
-    this.spawnCLI(sessionId, info, {
-      model: info.model,
-      permissionMode: info.permissionMode,
-      cwd: info.cwd,
-      resumeSessionId: info.cliSessionId,
-    });
+
+    if (info.backendType === "codex") {
+      this.spawnCodex(sessionId, info, {
+        model: info.model,
+        permissionMode: info.permissionMode,
+        cwd: info.cwd,
+        codexSandbox: info.codexSandbox,
+        codexInternetAccess: info.codexInternetAccess,
+      });
+    } else {
+      this.spawnCLI(sessionId, info, {
+        model: info.model,
+        permissionMode: info.permissionMode,
+        cwd: info.cwd,
+        resumeSessionId: info.cliSessionId,
+      });
+    }
     return true;
   }
 
@@ -183,12 +249,15 @@ export class CliLauncher {
 
   private spawnCLI(sessionId: string, info: SdkSessionInfo, options: LaunchOptions & { resumeSessionId?: string }): void {
     let binary = options.claudeBinary || "claude";
-    if (!binary.startsWith("/")) {
-      try {
-        binary = execSync(`which ${binary}`, { encoding: "utf-8" }).trim();
-      } catch {
-        // fall through, hope it's in PATH
-      }
+    const resolved = resolveBinary(binary);
+    if (resolved) {
+      binary = resolved;
+    } else {
+      console.error(`[cli-launcher] Binary "${binary}" not found in PATH`);
+      info.state = "exited";
+      info.exitCode = 127;
+      this.persistState();
+      return;
     }
 
     const sdkUrl = `ws://localhost:${this.port}/ws/cli/${sessionId}`;
@@ -230,10 +299,13 @@ export class CliLauncher {
     }
     args.push("-p", "");
 
+    // Use enriched PATH so spawned CLI processes inherit the user's
+    // full PATH (nvm, volta, etc.) regardless of how the server started.
     const env: Record<string, string | undefined> = {
       ...process.env,
-      CLAUDECODE: "1",
+      CLAUDECODE: undefined,
       ...options.env,
+      PATH: getEnrichedPath(),
     };
 
     console.log(`[cli-launcher] Spawning session ${sessionId}: ${binary} ${args.join(" ")}`);
@@ -274,6 +346,172 @@ export class CliLauncher {
 
     this.persistState();
   }
+
+  /**
+   * Spawn a Codex app-server subprocess for a session.
+   * Unlike Claude Code (which connects back via WebSocket), Codex uses stdio.
+   */
+  private prepareCodexHome(codexHome: string): void {
+    mkdirSync(codexHome, { recursive: true });
+
+    const legacyHome = getLegacyCodexHome();
+    if (resolve(legacyHome) === resolve(codexHome) || !existsSync(legacyHome)) {
+      return;
+    }
+
+    // Bootstrap only the user-level artifacts Codex needs (auth/config/skills),
+    // while intentionally skipping sessions/sqlite to avoid stale rollout indexes.
+    const fileSeeds = ["auth.json", "config.toml", "models_cache.json", "version.json"];
+    for (const name of fileSeeds) {
+      try {
+        const src = join(legacyHome, name);
+        const dest = join(codexHome, name);
+        if (!existsSync(dest) && existsSync(src)) {
+          copyFileSync(src, dest);
+        }
+      } catch (e) {
+        console.warn(`[cli-launcher] Failed to bootstrap ${name} from legacy home:`, e);
+      }
+    }
+
+    const dirSeeds = ["skills", "vendor_imports", "prompts", "rules"];
+    for (const name of dirSeeds) {
+      try {
+        const src = join(legacyHome, name);
+        const dest = join(codexHome, name);
+        if (!existsSync(dest) && existsSync(src)) {
+          cpSync(src, dest, { recursive: true });
+        }
+      } catch (e) {
+        console.warn(`[cli-launcher] Failed to bootstrap ${name}/ from legacy home:`, e);
+      }
+    }
+  }
+
+  private spawnCodex(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): void {
+    let binary = options.codexBinary || "codex";
+    const resolved = resolveBinary(binary);
+    if (resolved) {
+      binary = resolved;
+    } else {
+      console.error(`[cli-launcher] Binary "${binary}" not found in PATH`);
+      info.state = "exited";
+      info.exitCode = 127;
+      this.persistState();
+      return;
+    }
+
+    const args: string[] = ["app-server"];
+    const internetEnabled = options.codexInternetAccess === true;
+    args.push("-c", `tools.webSearch=${internetEnabled ? "true" : "false"}`);
+    const codexHome = resolveCompanionCodexSessionHome(
+      sessionId,
+      options.codexHome,
+    );
+    this.prepareCodexHome(codexHome);
+
+    // The codex binary is a Node.js script with `#!/usr/bin/env node` shebang.
+    // When Bun.spawn executes it, the kernel resolves `node` via /usr/bin/env
+    // which may find the system Node (e.g. v12) instead of the nvm-managed one.
+    // To guarantee the correct Node version, we resolve the `node` binary that
+    // lives alongside `codex` and spawn `node <codex.js>` directly.
+    const binaryDir = resolve(binary, "..");
+    const siblingNode = join(binaryDir, "node");
+    const enrichedPath = getEnrichedPath();
+    const spawnPath = [binaryDir, ...enrichedPath.split(":")].filter(Boolean).join(":");
+
+    // Determine whether to invoke node explicitly or use the binary directly.
+    // If a `node` binary exists next to `codex`, use it to bypass shebang issues.
+    let spawnCmd: string[];
+    if (existsSync(siblingNode)) {
+      // Resolve the real path of the codex script (follows symlinks)
+      // so node can load it as an ES module with the correct package.json context.
+      let codexScript: string;
+      try {
+        codexScript = realpathSync(binary);
+      } catch {
+        codexScript = binary;
+      }
+      spawnCmd = [siblingNode, codexScript, ...args];
+    } else {
+      spawnCmd = [binary, ...args];
+    }
+
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      CLAUDECODE: undefined,
+      ...options.env,
+      CODEX_HOME: codexHome,
+      PATH: spawnPath,
+    };
+
+    console.log(`[cli-launcher] Spawning Codex session ${sessionId}: ${spawnCmd.join(" ")}`);
+
+    const proc = Bun.spawn(spawnCmd, {
+      cwd: info.cwd,
+      env,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    info.pid = proc.pid;
+    this.processes.set(sessionId, proc);
+
+    // Pipe stderr for debugging (stdout is used for JSON-RPC)
+    const stderr = proc.stderr;
+    if (stderr && typeof stderr !== "number") {
+      this.pipeStream(sessionId, stderr, "stderr");
+    }
+
+    // Create the CodexAdapter which handles JSON-RPC and message translation
+    // Pass the raw permission mode — the adapter maps it to Codex's approval policy
+    const adapter = new CodexAdapter(proc, sessionId, {
+      model: options.model,
+      cwd: info.cwd,
+      approvalMode: options.permissionMode,
+      threadId: info.cliSessionId,
+      sandbox: options.codexSandbox,
+    });
+
+    // Handle init errors — mark session as exited so UI shows failure.
+    // Also clear cliSessionId so the next relaunch starts a fresh thread
+    // instead of trying to resume one whose rollout may be missing.
+    adapter.onInitError((error) => {
+      console.error(`[cli-launcher] Codex session ${sessionId} init failed: ${error}`);
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.state = "exited";
+        session.exitCode = 1;
+        session.cliSessionId = undefined;
+      }
+      this.persistState();
+    });
+
+    // Notify the WsBridge to attach this adapter
+    if (this.onCodexAdapter) {
+      this.onCodexAdapter(sessionId, adapter);
+    }
+
+    // Mark as connected immediately (no WS handshake needed for stdio)
+    info.state = "connected";
+
+    // Monitor process exit
+    const spawnedAt = Date.now();
+    proc.exited.then((exitCode) => {
+      console.log(`[cli-launcher] Codex session ${sessionId} exited (code=${exitCode})`);
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.state = "exited";
+        session.exitCode = exitCode;
+      }
+      this.processes.delete(sessionId);
+      this.persistState();
+    });
+
+    this.persistState();
+  }
+
 
   /**
    * Inject a CLAUDE.md file into the worktree with branch guardrails.

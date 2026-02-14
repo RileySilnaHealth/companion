@@ -1,63 +1,185 @@
 import type { SdkSessionInfo } from "./types.js";
+import { captureEvent, captureException } from "./analytics.js";
 
 const BASE = "/api";
 
-async function post<T = unknown>(path: string, body?: object): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+function nowMs(): number {
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return performance.now();
   }
-  return res.json();
+  return Date.now();
+}
+
+function trackApiSuccess(method: string, path: string, durationMs: number, status: number): void {
+  captureEvent("api_request_succeeded", {
+    method,
+    path,
+    status,
+    duration_ms: Math.round(durationMs),
+  });
+}
+
+function trackApiFailure(
+  method: string,
+  path: string,
+  durationMs: number,
+  error: unknown,
+  status?: number,
+): void {
+  captureEvent("api_request_failed", {
+    method,
+    path,
+    status,
+    duration_ms: Math.round(durationMs),
+    error: error instanceof Error ? error.message : String(error),
+  });
+  captureException(error, { method, path, status });
+}
+
+async function post<T = unknown>(path: string, body?: object): Promise<T> {
+  const startedAt = nowMs();
+  let failureTracked = false;
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const apiError = new Error(err.error || res.statusText);
+      trackApiFailure("POST", path, nowMs() - startedAt, apiError, res.status);
+      failureTracked = true;
+      throw apiError;
+    }
+    trackApiSuccess("POST", path, nowMs() - startedAt, res.status);
+    return res.json();
+  } catch (error) {
+    if (!failureTracked) {
+      trackApiFailure("POST", path, nowMs() - startedAt, error);
+    }
+    throw error;
+  }
 }
 
 async function get<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`);
-  if (!res.ok) throw new Error(res.statusText);
-  return res.json();
+  const startedAt = nowMs();
+  let failureTracked = false;
+  try {
+    const res = await fetch(`${BASE}${path}`);
+    if (!res.ok) {
+      const apiError = new Error(res.statusText);
+      trackApiFailure("GET", path, nowMs() - startedAt, apiError, res.status);
+      failureTracked = true;
+      throw apiError;
+    }
+    trackApiSuccess("GET", path, nowMs() - startedAt, res.status);
+    return res.json();
+  } catch (error) {
+    if (!failureTracked) {
+      trackApiFailure("GET", path, nowMs() - startedAt, error);
+    }
+    throw error;
+  }
 }
 
 async function put<T = unknown>(path: string, body?: object): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+  const startedAt = nowMs();
+  let failureTracked = false;
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const apiError = new Error(err.error || res.statusText);
+      trackApiFailure("PUT", path, nowMs() - startedAt, apiError, res.status);
+      failureTracked = true;
+      throw apiError;
+    }
+    trackApiSuccess("PUT", path, nowMs() - startedAt, res.status);
+    return res.json();
+  } catch (error) {
+    if (!failureTracked) {
+      trackApiFailure("PUT", path, nowMs() - startedAt, error);
+    }
+    throw error;
   }
-  return res.json();
 }
 
 async function patch<T = unknown>(path: string, body?: object): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+  const startedAt = nowMs();
+  let failureTracked = false;
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const apiError = new Error(err.error || res.statusText);
+      trackApiFailure("PATCH", path, nowMs() - startedAt, apiError, res.status);
+      failureTracked = true;
+      throw apiError;
+    }
+    trackApiSuccess("PATCH", path, nowMs() - startedAt, res.status);
+    return res.json();
+  } catch (error) {
+    if (!failureTracked) {
+      trackApiFailure("PATCH", path, nowMs() - startedAt, error);
+    }
+    throw error;
   }
-  return res.json();
 }
 
 async function del<T = unknown>(path: string, body?: object): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "DELETE",
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+  const startedAt = nowMs();
+  let failureTracked = false;
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "DELETE",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const apiError = new Error(err.error || res.statusText);
+      trackApiFailure("DELETE", path, nowMs() - startedAt, apiError, res.status);
+      failureTracked = true;
+      throw apiError;
+    }
+    trackApiSuccess("DELETE", path, nowMs() - startedAt, res.status);
+    return res.json();
+  } catch (error) {
+    if (!failureTracked) {
+      trackApiFailure("DELETE", path, nowMs() - startedAt, error);
+    }
+    throw error;
   }
-  return res.json();
+}
+
+export interface ContainerCreateOpts {
+  image?: string;
+  ports?: number[];
+  volumes?: string[];
+  env?: Record<string, string>;
+}
+
+export interface ContainerStatus {
+  available: boolean;
+  version: string | null;
+}
+
+export interface CloudProviderPlan {
+  provider: "modal";
+  sessionId: string;
+  image: string;
+  cwd: string;
+  mappedPorts: Array<{ containerPort: number; hostPort: number }>;
+  commandPreview: string;
 }
 
 export interface CreateSessionOpts {
@@ -65,11 +187,27 @@ export interface CreateSessionOpts {
   permissionMode?: string;
   cwd?: string;
   claudeBinary?: string;
+  codexBinary?: string;
+  codexInternetAccess?: boolean;
   allowedTools?: string[];
   envSlug?: string;
   branch?: string;
   createBranch?: boolean;
   useWorktree?: boolean;
+  backend?: "claude" | "codex";
+  container?: ContainerCreateOpts;
+}
+
+export interface BackendInfo {
+  id: string;
+  name: string;
+  available: boolean;
+}
+
+export interface BackendModelInfo {
+  value: string;
+  label: string;
+  description: string;
 }
 
 export interface GitRepoInfo {
@@ -130,12 +268,59 @@ export interface TreeNode {
   children?: TreeNode[];
 }
 
+export interface UpdateInfo {
+  currentVersion: string;
+  latestVersion: string | null;
+  updateAvailable: boolean;
+  isServiceMode: boolean;
+  updateInProgress: boolean;
+  lastChecked: number;
+}
+
+export interface UsageLimits {
+  five_hour: { utilization: number; resets_at: string | null } | null;
+  seven_day: { utilization: number; resets_at: string | null } | null;
+  extra_usage: {
+    is_enabled: boolean;
+    monthly_limit: number;
+    used_credits: number;
+    utilization: number | null;
+  } | null;
+}
+
+export interface AppSettings {
+  openrouterApiKeyConfigured: boolean;
+  openrouterModel: string;
+}
+
+export interface GitHubPRInfo {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED" | "MERGED";
+  isDraft: boolean;
+  reviewDecision: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  checks: { name: string; status: string; conclusion: string | null }[];
+  checksSummary: { total: number; success: number; failure: number; pending: number };
+  reviewThreads: { total: number; resolved: number; unresolved: number };
+}
+
+export interface PRStatusResponse {
+  available: boolean;
+  pr: GitHubPRInfo | null;
+}
+
 export const api = {
   createSession: (opts?: CreateSessionOpts) =>
-    post<{ sessionId: string; state: string; cwd: string }>("/sessions/create", opts),
+    post<{ sessionId: string; state: string; cwd: string }>(
+      "/sessions/create",
+      opts,
+    ),
 
-  listSessions: () =>
-    get<SdkSessionInfo[]>("/sessions"),
+  listSessions: () => get<SdkSessionInfo[]>("/sessions"),
 
   killSession: (sessionId: string) =>
     post(`/sessions/${encodeURIComponent(sessionId)}/kill`),
@@ -153,50 +338,131 @@ export const api = {
     post(`/sessions/${encodeURIComponent(sessionId)}/unarchive`),
 
   renameSession: (sessionId: string, name: string) =>
-    patch<{ ok: boolean; name: string }>(`/sessions/${encodeURIComponent(sessionId)}/name`, { name }),
+    patch<{ ok: boolean; name: string }>(
+      `/sessions/${encodeURIComponent(sessionId)}/name`,
+      { name },
+    ),
 
   listDirs: (path?: string) =>
-    get<DirListResult>(`/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+    get<DirListResult>(
+      `/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`,
+    ),
 
-  getHome: () =>
-    get<{ home: string; cwd: string }>("/fs/home"),
+  getHome: () => get<{ home: string; cwd: string }>("/fs/home"),
 
   // Environments
   listEnvs: () => get<CompanionEnv[]>("/envs"),
-  getEnv: (slug: string) => get<CompanionEnv>(`/envs/${encodeURIComponent(slug)}`),
+  getEnv: (slug: string) =>
+    get<CompanionEnv>(`/envs/${encodeURIComponent(slug)}`),
   createEnv: (name: string, variables: Record<string, string>) =>
     post<CompanionEnv>("/envs", { name, variables }),
-  updateEnv: (slug: string, data: { name?: string; variables?: Record<string, string> }) =>
-    put<CompanionEnv>(`/envs/${encodeURIComponent(slug)}`, data),
+  updateEnv: (
+    slug: string,
+    data: { name?: string; variables?: Record<string, string> },
+  ) => put<CompanionEnv>(`/envs/${encodeURIComponent(slug)}`, data),
   deleteEnv: (slug: string) => del(`/envs/${encodeURIComponent(slug)}`),
+
+  // Settings
+  getSettings: () => get<AppSettings>("/settings"),
+  updateSettings: (data: { openrouterApiKey?: string; openrouterModel?: string }) =>
+    put<AppSettings>("/settings", data),
 
   // Git operations
   getRepoInfo: (path: string) =>
     get<GitRepoInfo>(`/git/repo-info?path=${encodeURIComponent(path)}`),
   listBranches: (repoRoot: string) =>
-    get<GitBranchInfo[]>(`/git/branches?repoRoot=${encodeURIComponent(repoRoot)}`),
+    get<GitBranchInfo[]>(
+      `/git/branches?repoRoot=${encodeURIComponent(repoRoot)}`,
+    ),
   listWorktrees: (repoRoot: string) =>
-    get<GitWorktreeInfo[]>(`/git/worktrees?repoRoot=${encodeURIComponent(repoRoot)}`),
-  createWorktree: (repoRoot: string, branch: string, opts?: { baseBranch?: string; createBranch?: boolean }) =>
+    get<GitWorktreeInfo[]>(
+      `/git/worktrees?repoRoot=${encodeURIComponent(repoRoot)}`,
+    ),
+  createWorktree: (
+    repoRoot: string,
+    branch: string,
+    opts?: { baseBranch?: string; createBranch?: boolean },
+  ) =>
     post<WorktreeCreateResult>("/git/worktree", { repoRoot, branch, ...opts }),
   removeWorktree: (repoRoot: string, worktreePath: string, force?: boolean) =>
-    del<{ removed: boolean; reason?: string }>("/git/worktree", { repoRoot, worktreePath, force }),
+    del<{ removed: boolean; reason?: string }>("/git/worktree", {
+      repoRoot,
+      worktreePath,
+      force,
+    }),
   gitFetch: (repoRoot: string) =>
     post<{ success: boolean; output: string }>("/git/fetch", { repoRoot }),
   gitPull: (cwd: string) =>
-    post<{ success: boolean; output: string; git_ahead: number; git_behind: number }>("/git/pull", { cwd }),
+    post<{
+      success: boolean;
+      output: string;
+      git_ahead: number;
+      git_behind: number;
+    }>("/git/pull", { cwd }),
+
+  // GitHub PR status
+  getPRStatus: (cwd: string, branch: string) =>
+    get<PRStatusResponse>(
+      `/git/pr-status?cwd=${encodeURIComponent(cwd)}&branch=${encodeURIComponent(branch)}`,
+    ),
+
+  // Backends
+  getBackends: () => get<BackendInfo[]>("/backends"),
+  getBackendModels: (backendId: string) =>
+    get<BackendModelInfo[]>(`/backends/${encodeURIComponent(backendId)}/models`),
+
+  // Containers
+  getContainerStatus: () => get<ContainerStatus>("/containers/status"),
+  getContainerImages: () => get<string[]>("/containers/images"),
+  getCloudProviderPlan: (provider: "modal", cwd: string, sessionId: string) =>
+    get<CloudProviderPlan>(
+      `/cloud/providers/${encodeURIComponent(provider)}/plan?cwd=${encodeURIComponent(cwd)}&sessionId=${encodeURIComponent(sessionId)}`,
+    ),
 
   // Editor
   startEditor: (sessionId: string) =>
-    post<{ url: string }>(`/sessions/${encodeURIComponent(sessionId)}/editor/start`),
+    post<{ url: string }>(
+      `/sessions/${encodeURIComponent(sessionId)}/editor/start`,
+    ),
 
   // Editor filesystem
   getFileTree: (path: string) =>
-    get<{ path: string; tree: TreeNode[] }>(`/fs/tree?path=${encodeURIComponent(path)}`),
+    get<{ path: string; tree: TreeNode[] }>(
+      `/fs/tree?path=${encodeURIComponent(path)}`,
+    ),
   readFile: (path: string) =>
-    get<{ path: string; content: string }>(`/fs/read?path=${encodeURIComponent(path)}`),
+    get<{ path: string; content: string }>(
+      `/fs/read?path=${encodeURIComponent(path)}`,
+    ),
   writeFile: (path: string, content: string) =>
     put<{ ok: boolean; path: string }>("/fs/write", { path, content }),
   getFileDiff: (path: string) =>
-    get<{ path: string; diff: string }>(`/fs/diff?path=${encodeURIComponent(path)}`),
+    get<{ path: string; diff: string }>(
+      `/fs/diff?path=${encodeURIComponent(path)}`,
+    ),
+  getClaudeMdFiles: (cwd: string) =>
+    get<{ cwd: string; files: { path: string; content: string }[] }>(
+      `/fs/claude-md?cwd=${encodeURIComponent(cwd)}`,
+    ),
+  saveClaudeMd: (path: string, content: string) =>
+    put<{ ok: boolean; path: string }>("/fs/claude-md", { path, content }),
+
+  // Usage limits
+  getUsageLimits: () => get<UsageLimits>("/usage-limits"),
+  getSessionUsageLimits: (sessionId: string) =>
+    get<UsageLimits>(`/sessions/${encodeURIComponent(sessionId)}/usage-limits`),
+
+  // Terminal
+  spawnTerminal: (cwd: string, cols?: number, rows?: number) =>
+    post<{ terminalId: string }>("/terminal/spawn", { cwd, cols, rows }),
+  killTerminal: () =>
+    post<{ ok: boolean }>("/terminal/kill"),
+  getTerminal: () =>
+    get<{ active: boolean; terminalId?: string; cwd?: string }>("/terminal"),
+
+  // Update checking
+  checkForUpdate: () => get<UpdateInfo>("/update-check"),
+  forceCheckForUpdate: () => post<UpdateInfo>("/update-check"),
+  triggerUpdate: () =>
+    post<{ ok: boolean; message: string }>("/update"),
 };
