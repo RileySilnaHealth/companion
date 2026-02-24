@@ -165,8 +165,9 @@ export function createRoutes(
   });
 
   // ─── SDK Sessions (--sdk-url) ─────────────────────────────────────
+  // Note: /sessions/create-with-message is kept as an alias for backwards compatibility
 
-  api.post("/sessions/create", async (c) => {
+  const createSessionHandler = async (c: Parameters<Parameters<typeof api.post>[1]>[0]) => {
     const body = await c.req.json().catch(() => ({}));
     try {
       const resumeSessionAt = typeof body.resumeSessionAt === "string" && body.resumeSessionAt.trim()
@@ -425,15 +426,10 @@ export function createRoutes(
       console.error("[routes] Failed to create session:", msg);
       return c.json({ error: msg }, 500);
     }
-  });
+  };
 
-  // Backwards-compatible alias for /sessions/create with message
-  api.post("/sessions/create-with-message", async (c) => {
-    const url = new URL(c.req.url);
-    url.pathname = url.pathname.replace("/create-with-message", "/create");
-    const newReq = new Request(url.toString(), c.req.raw);
-    return api.fetch(newReq, c.env);
-  });
+  api.post("/sessions/create", createSessionHandler);
+  api.post("/sessions/create-with-message", createSessionHandler);
 
   // ─── SSE Session Creation (with progress streaming) ─────────────────────
 
