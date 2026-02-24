@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { SessionState } from "../../server/session-types.js";
 
@@ -8,6 +8,8 @@ import type { SessionState } from "../../server/session-types.js";
 Element.prototype.scrollIntoView = vi.fn();
 
 const mockSendToSession = vi.fn();
+const mockListPrompts = vi.fn();
+const mockCreatePrompt = vi.fn();
 
 // Build a controllable mock store state
 let mockStoreState: Record<string, unknown> = {};
@@ -19,6 +21,8 @@ vi.mock("../ws.js", () => ({
 vi.mock("../api.js", () => ({
   api: {
     gitPull: vi.fn().mockResolvedValue({ success: true, output: "", git_ahead: 0, git_behind: 0 }),
+    listPrompts: (...args: unknown[]) => mockListPrompts(...args),
+    createPrompt: (...args: unknown[]) => mockCreatePrompt(...args),
   },
 }));
 
@@ -42,7 +46,7 @@ import { Composer } from "./Composer.js";
 function makeSession(overrides: Partial<SessionState> = {}): SessionState {
   return {
     session_id: "s1",
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6",
     cwd: "/test",
     tools: [],
     permissionMode: "acceptEdits",
@@ -57,6 +61,7 @@ function makeSession(overrides: Partial<SessionState> = {}): SessionState {
     is_compacting: false,
     git_branch: "",
     is_worktree: false,
+    is_containerized: false,
     repo_root: "",
     git_ahead: 0,
     git_behind: 0,
@@ -94,14 +99,26 @@ function setupMockStore(overrides: {
     cliConnected: cliConnectedMap,
     sessionStatus: sessionStatusMap,
     previousPermissionMode: previousPermissionModeMap,
+    sdkSessions: [{ sessionId: "s1", model: "claude-sonnet-4-6", backendType: "claude", cwd: "/test" }],
+    sessionNames: new Map<string, string>(),
     appendMessage: mockAppendMessage,
     updateSession: mockUpdateSession,
     setPreviousPermissionMode: mockSetPreviousPermissionMode,
+    setSdkSessions: vi.fn(),
   };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockListPrompts.mockResolvedValue([]);
+  mockCreatePrompt.mockResolvedValue({
+    id: "p-new",
+    name: "New Prompt",
+    content: "Text",
+    scope: "project",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
   setupMockStore();
 });
 
@@ -113,7 +130,7 @@ describe("Composer basic rendering", () => {
     const textarea = container.querySelector("textarea");
     expect(textarea).toBeTruthy();
     // Send button (the round one with the arrow SVG) - identified by title
-    const sendBtn = screen.getByTitle("Send message");
+    const sendBtn = screen.getAllByTitle("Send message")[0];
     expect(sendBtn).toBeTruthy();
   });
 });
@@ -123,14 +140,14 @@ describe("Composer basic rendering", () => {
 describe("Composer send button state", () => {
   it("send button is disabled when text is empty", () => {
     render(<Composer sessionId="s1" />);
-    const sendBtn = screen.getByTitle("Send message");
+    const sendBtn = screen.getAllByTitle("Send message")[0];
     expect(sendBtn.hasAttribute("disabled")).toBe(true);
   });
 
   it("send button is disabled when CLI is not connected", () => {
     setupMockStore({ isConnected: false });
     render(<Composer sessionId="s1" />);
-    const sendBtn = screen.getByTitle("Send message");
+    const sendBtn = screen.getAllByTitle("Send message")[0];
     expect(sendBtn.hasAttribute("disabled")).toBe(true);
   });
 
@@ -140,7 +157,7 @@ describe("Composer send button state", () => {
 
     fireEvent.change(textarea, { target: { value: "Hello world" } });
 
-    const sendBtn = screen.getByTitle("Send message");
+    const sendBtn = screen.getAllByTitle("Send message")[0];
     expect(sendBtn.hasAttribute("disabled")).toBe(false);
   });
 });
@@ -177,7 +194,7 @@ describe("Composer sending messages", () => {
     const textarea = container.querySelector("textarea")!;
 
     fireEvent.change(textarea, { target: { value: "click send" } });
-    fireEvent.click(screen.getByTitle("Send message"));
+    fireEvent.click(screen.getAllByTitle("Send message")[0]);
 
     expect(mockSendToSession).toHaveBeenCalledWith("s1", expect.objectContaining({
       type: "user_message",
@@ -220,17 +237,17 @@ describe("Composer interrupt button", () => {
     setupMockStore({ sessionStatus: "running" });
     render(<Composer sessionId="s1" />);
 
-    const stopBtn = screen.getByTitle("Stop generation");
+    const stopBtn = screen.getAllByTitle("Stop generation")[0];
     expect(stopBtn).toBeTruthy();
-    // Send button should not be present
-    expect(screen.queryByTitle("Send message")).toBeNull();
+    // Send button should not be present (both mobile and desktop show stop)
+    expect(screen.queryAllByTitle("Send message")).toHaveLength(0);
   });
 
   it("interrupt button sends interrupt message", () => {
     setupMockStore({ sessionStatus: "running" });
     render(<Composer sessionId="s1" />);
 
-    fireEvent.click(screen.getByTitle("Stop generation"));
+    fireEvent.click(screen.getAllByTitle("Stop generation")[0]);
 
     expect(mockSendToSession).toHaveBeenCalledWith("s1", { type: "interrupt" });
   });
@@ -239,8 +256,8 @@ describe("Composer interrupt button", () => {
     setupMockStore({ sessionStatus: "idle" });
     render(<Composer sessionId="s1" />);
 
-    expect(screen.getByTitle("Send message")).toBeTruthy();
-    expect(screen.queryByTitle("Stop generation")).toBeNull();
+    expect(screen.getAllByTitle("Send message")[0]).toBeTruthy();
+    expect(screen.queryAllByTitle("Stop generation")).toHaveLength(0);
   });
 });
 
@@ -342,5 +359,217 @@ describe("Composer disabled state", () => {
     const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
 
     expect(textarea.placeholder).toContain("Waiting for CLI connection");
+  });
+});
+
+describe("Composer @ prompts menu", () => {
+  it("opens @ menu and inserts selected prompt with Enter", async () => {
+    // Validates keyboard insertion from @ suggestions without sending the message.
+    mockListPrompts.mockResolvedValue([
+      {
+        id: "p1",
+        name: "review-pr",
+        content: "Review this PR and list risks.",
+        scope: "global",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    fireEvent.change(textarea, { target: { value: "@rev", selectionStart: 4 } });
+    await screen.findByText("@review-pr");
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect((textarea as HTMLTextAreaElement).value).toContain("Review this PR and list risks.");
+    expect(mockSendToSession).not.toHaveBeenCalled();
+  });
+
+  it("filters prompts by typed query", async () => {
+    // Validates fuzzy filtering by prompt name while typing after @.
+    mockListPrompts.mockResolvedValue([
+      {
+        id: "p1",
+        name: "review-pr",
+        content: "Review this PR",
+        scope: "global",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+      {
+        id: "p2",
+        name: "write-tests",
+        content: "Write tests",
+        scope: "project",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    fireEvent.change(textarea, { target: { value: "@wri", selectionStart: 4 } });
+    await screen.findByText("@write-tests");
+
+    expect(screen.getByText("@write-tests")).toBeTruthy();
+    expect(screen.queryByText("@review-pr")).toBeNull();
+  });
+
+  it("does not refetch prompts on each @ query keystroke", async () => {
+    // Validates prompt fetch remains stable while filtering happens client-side.
+    mockListPrompts.mockResolvedValue([
+      {
+        id: "p1",
+        name: "review-pr",
+        content: "Review this PR",
+        scope: "global",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    await waitFor(() => {
+      expect(mockListPrompts).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.change(textarea, { target: { value: "@r", selectionStart: 2 } });
+    await screen.findByText("@review-pr");
+    fireEvent.change(textarea, { target: { value: "@re", selectionStart: 3 } });
+    await screen.findByText("@review-pr");
+    fireEvent.change(textarea, { target: { value: "@rev", selectionStart: 4 } });
+    await screen.findByText("@review-pr");
+
+    expect(mockListPrompts).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Keyboard navigation ────────────────────────────────────────────────────
+
+describe("Composer keyboard navigation", () => {
+  it("Escape in the slash menu does not send a message", () => {
+    // Verifies pressing Escape while the slash menu is open does not trigger
+    // a message send — the key event should be consumed by the menu handler.
+    setupMockStore({
+      session: {
+        slash_commands: ["help", "clear"],
+        skills: [],
+      },
+    });
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    fireEvent.change(textarea, { target: { value: "/" } });
+    expect(screen.getByText("/help")).toBeTruthy();
+
+    fireEvent.keyDown(textarea, { key: "Escape" });
+
+    // Escape should NOT send any message
+    expect(mockSendToSession).not.toHaveBeenCalled();
+    // The text should still be "/" (not cleared)
+    expect((textarea as HTMLTextAreaElement).value).toBe("/");
+  });
+
+  it("ArrowDown/ArrowUp cycles through slash menu items", () => {
+    // Verifies keyboard arrow navigation within the slash command menu.
+    setupMockStore({
+      session: {
+        slash_commands: ["help", "clear"],
+        skills: [],
+      },
+    });
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    fireEvent.change(textarea, { target: { value: "/" } });
+    // First item should be highlighted by default (index 0)
+    const items = screen.getAllByRole("button").filter(
+      (btn) => btn.textContent?.startsWith("/"),
+    );
+    expect(items.length).toBeGreaterThanOrEqual(2);
+
+    // Arrow down should move selection — pressing Enter selects the item
+    fireEvent.keyDown(textarea, { key: "ArrowDown" });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    // The selected command should replace the textarea content
+    expect((textarea as HTMLTextAreaElement).value).toContain("/clear");
+  });
+
+  it("Enter selects the highlighted slash command", () => {
+    // Verifies that pressing Enter in the slash menu selects the command
+    // without sending it as a message.
+    setupMockStore({
+      session: {
+        slash_commands: ["help"],
+        skills: [],
+      },
+    });
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    fireEvent.change(textarea, { target: { value: "/" } });
+    expect(screen.getByText("/help")).toBeTruthy();
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    // Should NOT send a WebSocket message — it should just fill the command
+    expect(mockSendToSession).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Layout & overflow ──────────────────────────────────────────────────────
+
+describe("Composer layout", () => {
+  it("textarea has overflow-y-auto to handle long content", () => {
+    // Verifies the textarea scrolls vertically rather than expanding infinitely.
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+    expect(textarea.className).toContain("overflow-y-auto");
+  });
+
+  it("send button has consistent dimensions", () => {
+    // Verifies the send button has explicit sizing classes for consistent layout.
+    // Both mobile (w-10 h-10) and desktop (w-9 h-9) send buttons exist in JSDOM.
+    render(<Composer sessionId="s1" />);
+    const sendBtns = screen.getAllByTitle("Send message");
+    expect(sendBtns.length).toBeGreaterThanOrEqual(1);
+    // At least one button should have explicit width/height classes
+    const hasSize = sendBtns.some((btn) => btn.className.includes("w-"));
+    expect(hasSize).toBe(true);
+  });
+
+  it("textarea is full-width within its container", () => {
+    // Verifies the textarea stretches to fill the input area.
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+    expect(textarea.className).toContain("w-full");
+  });
+});
+
+describe("Composer save prompt", () => {
+  it("shows save error when create prompt fails", async () => {
+    // Validates API failures are visible to the user instead of being silently ignored.
+    mockCreatePrompt.mockRejectedValue(new Error("Could not save prompt right now"));
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+
+    fireEvent.change(textarea, { target: { value: "Prompt body text" } });
+    // Mobile + desktop layouts render separate buttons; click the first visible one.
+    fireEvent.click(screen.getAllByTitle("Save as prompt")[0]);
+    const titleInput = screen.getByPlaceholderText("Prompt title");
+    fireEvent.change(titleInput, { target: { value: "My Prompt" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    expect(await screen.findByText("Could not save prompt right now")).toBeTruthy();
+  });
+
+  it("passes axe accessibility checks", async () => {
+    const { axe } = await import("vitest-axe");
+    setupMockStore({ isConnected: true });
+    const { container } = render(<Composer sessionId="s1" />);
+    const results = await axe(container);
+    expect(results).toHaveNoViolations();
   });
 });

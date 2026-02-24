@@ -1,108 +1,283 @@
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useStore } from "../store.js";
-import { api } from "../api.js";
+import { parseHash } from "../utils/routing.js";
+
+type WorkspaceTab = "chat" | "diff" | "terminal" | "processes" | "editor";
 
 export function TopBar() {
+  const hash = useSyncExternalStore(
+    (cb) => {
+      window.addEventListener("hashchange", cb);
+      return () => window.removeEventListener("hashchange", cb);
+    },
+    () => window.location.hash,
+  );
+  const route = useMemo(() => parseHash(hash), [hash]);
+  const isSessionView = route.page === "session" || route.page === "home";
   const currentSessionId = useStore((s) => s.currentSessionId);
   const cliConnected = useStore((s) => s.cliConnected);
   const sessionStatus = useStore((s) => s.sessionStatus);
+  const sessionNames = useStore((s) => s.sessionNames);
+  const sdkSessions = useStore((s) => s.sdkSessions);
   const sidebarOpen = useStore((s) => s.sidebarOpen);
   const setSidebarOpen = useStore((s) => s.setSidebarOpen);
   const taskPanelOpen = useStore((s) => s.taskPanelOpen);
   const setTaskPanelOpen = useStore((s) => s.setTaskPanelOpen);
   const activeTab = useStore((s) => s.activeTab);
   const setActiveTab = useStore((s) => s.setActiveTab);
+  const markChatTabReentry = useStore((s) => s.markChatTabReentry);
+  const quickTerminalOpen = useStore((s) => s.quickTerminalOpen);
+  const quickTerminalTabs = useStore((s) => s.quickTerminalTabs);
+  const openQuickTerminal = useStore((s) => s.openQuickTerminal);
+  const resetQuickTerminal = useStore((s) => s.resetQuickTerminal);
+  const changedFilesCount = useStore((s) =>
+    currentSessionId ? (s.gitChangedFilesCount.get(currentSessionId) ?? 0) : 0
+  );
 
-  const isConnected = currentSessionId ? (cliConnected.get(currentSessionId) ?? false) : false;
+  const runningProcessCount = useStore((s) => {
+    if (!currentSessionId) return 0;
+    const processes = s.sessionProcesses.get(currentSessionId);
+    if (!processes) return 0;
+    return processes.filter((p) => p.status === "running").length;
+  });
+
+  const cwd = useStore((s) => {
+    if (!currentSessionId) return null;
+    return (
+      s.sessions.get(currentSessionId)?.cwd ||
+      s.sdkSessions.find((sdk) => sdk.sessionId === currentSessionId)?.cwd ||
+      null
+    );
+  });
+  const sdkSession = useStore((s) => {
+    if (!currentSessionId) return null;
+    return s.sdkSessions.find((sdk) => sdk.sessionId === currentSessionId) || null;
+  });
+  const bridgeSession = useStore((s) => {
+    if (!currentSessionId) return null;
+    return s.sessions.get(currentSessionId) || null;
+  });
+  const defaultTerminalOpts = useMemo(() => {
+    if (sdkSession?.containerId) {
+      return { target: "docker" as const, cwd: "/workspace", containerId: sdkSession.containerId };
+    }
+    return { target: "host" as const, cwd: cwd || "" };
+  }, [cwd, sdkSession?.containerId]);
+  const terminalButtonTitle = !cwd
+    ? "Terminal unavailable while session is reconnecting"
+    : sdkSession?.containerId || bridgeSession?.is_containerized
+      ? "Open terminal in session container (Ctrl/Cmd+J)"
+      : "Quick terminal (Ctrl/Cmd+J)";
   const status = currentSessionId ? (sessionStatus.get(currentSessionId) ?? null) : null;
+  const isConnected = currentSessionId ? (cliConnected.get(currentSessionId) ?? false) : false;
+  const sessionName = currentSessionId
+    ? (sessionNames?.get(currentSessionId) ||
+      sdkSessions.find((s) => s.sessionId === currentSessionId)?.name ||
+      `Session ${currentSessionId.slice(0, 8)}`)
+    : null;
+  const showWorkspaceControls = !!(currentSessionId && isSessionView);
+  const showContextToggle = route.page === "session" && !!currentSessionId;
+  const workspaceTabs: WorkspaceTab[] = ["chat", "diff", "terminal", "processes", "editor"];
+
+  const activateWorkspaceTab = (tab: WorkspaceTab) => {
+    if (tab === "terminal") {
+      if (!cwd) return;
+      if (!quickTerminalOpen || quickTerminalTabs.length === 0) {
+        openQuickTerminal({ ...defaultTerminalOpts, reuseIfExists: true });
+      }
+      setActiveTab("terminal");
+      return;
+    }
+
+    if (tab === "editor") {
+      if (!cwd) return;
+      setActiveTab("editor");
+      return;
+    }
+
+    if (tab === "chat" && activeTab !== "chat" && currentSessionId) {
+      markChatTabReentry(currentSessionId);
+    }
+    setActiveTab(tab);
+  };
+
+  useEffect(() => {
+    if (!currentSessionId) {
+      resetQuickTerminal();
+    }
+  }, [currentSessionId, resetQuickTerminal]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "j") return;
+      if (!showWorkspaceControls) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.isContentEditable)) {
+        return;
+      }
+      event.preventDefault();
+      const currentIndex = Math.max(0, workspaceTabs.indexOf(activeTab as WorkspaceTab));
+      const direction = event.shiftKey ? -1 : 1;
+      const nextIndex = (currentIndex + direction + workspaceTabs.length) % workspaceTabs.length;
+      activateWorkspaceTab(workspaceTabs[nextIndex]);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showWorkspaceControls, workspaceTabs, activeTab, cwd, quickTerminalOpen, quickTerminalTabs.length, openQuickTerminal, defaultTerminalOpts, setActiveTab, markChatTabReentry, currentSessionId]);
 
   return (
-    <header className="shrink-0 flex items-center justify-between px-2 sm:px-4 py-2 sm:py-2.5 bg-cc-card border-b border-cc-border">
-      <div className="flex items-center gap-3">
-        {/* Sidebar toggle */}
+    <header className="relative shrink-0 h-11 px-4 bg-cc-bg">
+      <div className="h-full flex items-center gap-1 min-w-0">
         <button
           onClick={() => setSidebarOpen(!sidebarOpen)}
-          className="flex items-center justify-center w-7 h-7 rounded-lg text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+          className={`flex items-center justify-center w-8 h-8 rounded-md transition-colors cursor-pointer shrink-0 ${
+            sidebarOpen
+              ? "text-cc-primary bg-cc-active"
+              : "text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
+          }`}
+          aria-label="Toggle sidebar"
         >
-          <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
-            <path fillRule="evenodd" d="M3 5a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 15a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clipRule="evenodd" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-[15px] h-[15px]">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3 3h18v18H3V3z" />
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 3v18" />
           </svg>
         </button>
 
-        {/* Connection status */}
-        {currentSessionId && (
-          <div className="flex items-center gap-1.5">
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                isConnected ? "bg-cc-success" : "bg-cc-muted opacity-40"
-              }`}
-            />
-            {isConnected ? (
-              <span className="text-[11px] text-cc-muted hidden sm:inline">Connected</span>
-            ) : (
+        {showWorkspaceControls && (
+          <div className="flex-1 flex items-center justify-center gap-0.5 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               <button
-                onClick={() => currentSessionId && api.relaunchSession(currentSessionId).catch(console.error)}
-                className="text-[11px] text-cc-warning hover:text-cc-warning/80 font-medium cursor-pointer hidden sm:inline"
+                onClick={() => activateWorkspaceTab("chat")}
+                className={`h-full px-3 text-[12px] font-medium transition-colors cursor-pointer flex items-center gap-1.5 border-b-[1.5px] shrink-0 ${
+                  activeTab === "chat"
+                    ? "text-cc-fg border-cc-primary"
+                    : "text-cc-muted hover:text-cc-fg border-transparent"
+                }`}
+                title={sessionName || "Session"}
+                aria-label="Session tab"
               >
-                Reconnect
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    !isConnected
+                      ? "bg-cc-muted opacity-45"
+                      : status === "running"
+                        ? "bg-cc-primary"
+                        : status === "compacting"
+                          ? "bg-cc-warning"
+                          : "bg-cc-success"
+                  }`} />
+                  Session
               </button>
-            )}
+              <button
+                onClick={() => activateWorkspaceTab("diff")}
+                className={`h-full px-3 text-[12px] font-medium transition-colors cursor-pointer flex items-center gap-1.5 border-b-[1.5px] shrink-0 ${
+                  activeTab === "diff"
+                    ? "text-cc-fg border-cc-primary"
+                    : "text-cc-muted hover:text-cc-fg border-transparent"
+                }`}
+                aria-label="Diffs tab"
+              >
+                Diffs
+                {changedFilesCount > 0 && (
+                  <span className="text-[9px] rounded-full min-w-[15px] h-[15px] px-1 flex items-center justify-center font-semibold leading-none bg-amber-100 text-amber-700 dark:bg-amber-900/60 dark:text-amber-300">
+                    {changedFilesCount}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => activateWorkspaceTab("terminal")}
+                disabled={!cwd}
+                className={`h-full px-3 text-[12px] font-medium transition-colors flex items-center border-b-[1.5px] shrink-0 ${
+                  !cwd
+                    ? "text-cc-muted/50 border-transparent cursor-not-allowed"
+                    : activeTab === "terminal"
+                      ? "text-cc-fg border-cc-primary cursor-pointer"
+                      : "text-cc-muted hover:text-cc-fg border-transparent cursor-pointer"
+                }`}
+                title={terminalButtonTitle}
+                aria-label="Shell tab"
+              >
+                Shell
+              </button>
+              <button
+                onClick={() => activateWorkspaceTab("processes")}
+                className={`h-full px-3 text-[12px] font-medium transition-colors cursor-pointer flex items-center gap-1.5 border-b-[1.5px] shrink-0 ${
+                  activeTab === "processes"
+                    ? "text-cc-fg border-cc-primary"
+                    : "text-cc-muted hover:text-cc-fg border-transparent"
+                }`}
+                aria-label="Processes tab"
+              >
+                Processes
+                {runningProcessCount > 0 && (
+                  <span className="text-[9px] rounded-full min-w-[15px] h-[15px] px-1 flex items-center justify-center font-semibold leading-none bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-300">
+                    {runningProcessCount}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => activateWorkspaceTab("editor")}
+                disabled={!cwd}
+                className={`h-full px-3 text-[12px] font-medium transition-colors flex items-center border-b-[1.5px] shrink-0 ${
+                  !cwd
+                    ? "text-cc-muted/50 border-transparent cursor-not-allowed"
+                    : activeTab === "editor"
+                      ? "text-cc-fg border-cc-primary cursor-pointer"
+                      : "text-cc-muted hover:text-cc-fg border-transparent cursor-pointer"
+                }`}
+                title={!cwd ? "Editor unavailable while session is reconnecting" : "Editor"}
+                aria-label="Editor tab"
+              >
+                Editor
+              </button>
           </div>
         )}
+
+        <div className="flex items-center gap-0.5 shrink-0">
+          <ThemeToggle />
+          {showContextToggle && (
+            <button
+              onClick={() => setTaskPanelOpen(!taskPanelOpen)}
+              className={`flex items-center justify-center w-8 h-8 rounded-md transition-colors cursor-pointer ${
+                taskPanelOpen
+                  ? "text-cc-primary bg-cc-active"
+                  : "text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
+              }`}
+              title="Toggle context panel"
+              aria-label="Toggle context panel"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-[15px] h-[15px]">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 3h18v18H3V3z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 3v18" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
 
-      {/* Right side */}
-      {currentSessionId && (
-        <div className="flex items-center gap-2 sm:gap-3 text-[12px] text-cc-muted">
-          {status === "compacting" && (
-            <span className="text-cc-warning font-medium animate-pulse">Compacting...</span>
-          )}
-
-          {status === "running" && (
-            <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-cc-primary animate-[pulse-dot_1s_ease-in-out_infinite]" />
-              <span className="text-cc-primary font-medium">Thinking</span>
-            </div>
-          )}
-
-          {/* Chat / Editor tab toggle */}
-          <div className="flex items-center bg-cc-hover rounded-lg p-0.5">
-            <button
-              onClick={() => setActiveTab("chat")}
-              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
-                activeTab === "chat"
-                  ? "bg-cc-card text-cc-fg shadow-sm"
-                  : "text-cc-muted hover:text-cc-fg"
-              }`}
-            >
-              Chat
-            </button>
-            <button
-              onClick={() => setActiveTab("editor")}
-              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
-                activeTab === "editor"
-                  ? "bg-cc-card text-cc-fg shadow-sm"
-                  : "text-cc-muted hover:text-cc-fg"
-              }`}
-            >
-              Editor
-            </button>
-          </div>
-
-          <button
-            onClick={() => setTaskPanelOpen(!taskPanelOpen)}
-            className={`flex items-center justify-center w-7 h-7 rounded-lg transition-colors cursor-pointer ${
-              taskPanelOpen
-                ? "text-cc-primary bg-cc-active"
-                : "text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
-            }`}
-            title="Toggle session panel"
-          >
-            <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
-              <path fillRule="evenodd" d="M6 2a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V4a2 2 0 00-2-2H6zm1 3a1 1 0 000 2h6a1 1 0 100-2H7zm0 4a1 1 0 000 2h6a1 1 0 100-2H7zm0 4a1 1 0 000 2h4a1 1 0 100-2H7z" clipRule="evenodd" />
-            </svg>
-          </button>
-        </div>
-      )}
     </header>
+  );
+}
+
+function ThemeToggle() {
+  const darkMode = useStore((s) => s.darkMode);
+  const toggle = useCallback(() => useStore.getState().toggleDarkMode(), []);
+
+  return (
+    <button
+      onClick={toggle}
+      className="flex items-center justify-center w-8 h-8 rounded-md text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+      title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
+      aria-label={darkMode ? "Switch to light mode" : "Switch to dark mode"}
+    >
+      {darkMode ? (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-[15px] h-[15px]">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-[15px] h-[15px]">
+          <path d="M21 12.79A9 9 0 1111.21 3a7 7 0 009.79 9.79z" />
+        </svg>
+      )}
+    </button>
   );
 }

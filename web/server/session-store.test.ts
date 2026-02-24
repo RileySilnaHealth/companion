@@ -11,7 +11,7 @@ function makeSession(id: string, overrides: Partial<PersistedSession> = {}): Per
     id,
     state: {
       session_id: id,
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6",
       cwd: "/test",
       tools: [],
       permissionMode: "default",
@@ -26,6 +26,7 @@ function makeSession(id: string, overrides: Partial<PersistedSession> = {}): Per
       is_compacting: false,
       git_branch: "",
       is_worktree: false,
+      is_containerized: false,
       repo_root: "",
       git_ahead: 0,
       git_behind: 0,
@@ -89,6 +90,12 @@ describe("saveSync / load", () => {
           },
         ],
       ],
+      eventBuffer: [
+        { seq: 1, message: { type: "cli_connected" } },
+      ],
+      nextEventSeq: 2,
+      lastAckSeq: 1,
+      processedClientMessageIds: ["client-msg-1", "client-msg-2"],
       archived: true,
     });
 
@@ -98,6 +105,10 @@ describe("saveSync / load", () => {
     expect(loaded!.archived).toBe(true);
     expect(loaded!.pendingPermissions).toHaveLength(1);
     expect(loaded!.pendingMessages).toEqual(["msg1", "msg2"]);
+    expect(loaded!.eventBuffer).toEqual([{ seq: 1, message: { type: "cli_connected" } }]);
+    expect(loaded!.nextEventSeq).toBe(2);
+    expect(loaded!.lastAckSeq).toBe(1);
+    expect(loaded!.processedClientMessageIds).toEqual(["client-msg-1", "client-msg-2"]);
   });
 });
 

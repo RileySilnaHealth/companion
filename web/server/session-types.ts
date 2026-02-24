@@ -29,6 +29,86 @@ export interface CLISystemStatusMessage {
   session_id: string;
 }
 
+export interface CLICompactBoundaryMessage {
+  type: "system";
+  subtype: "compact_boundary";
+  compact_metadata: {
+    trigger: "manual" | "auto";
+    pre_tokens: number;
+  };
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLITaskNotificationMessage {
+  type: "system";
+  subtype: "task_notification";
+  task_id: string;
+  status: "completed" | "failed" | "stopped";
+  output_file: string;
+  summary: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIFilesPersistedMessage {
+  type: "system";
+  subtype: "files_persisted";
+  files: { filename: string; file_id: string }[];
+  failed: { filename: string; error: string }[];
+  processed_at: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIHookStartedMessage {
+  type: "system";
+  subtype: "hook_started";
+  hook_id: string;
+  hook_name: string;
+  hook_event: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIHookProgressMessage {
+  type: "system";
+  subtype: "hook_progress";
+  hook_id: string;
+  hook_name: string;
+  hook_event: string;
+  stdout: string;
+  stderr: string;
+  output: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIHookResponseMessage {
+  type: "system";
+  subtype: "hook_response";
+  hook_id: string;
+  hook_name: string;
+  hook_event: string;
+  output: string;
+  stdout: string;
+  stderr: string;
+  exit_code?: number;
+  outcome: "success" | "error" | "cancelled";
+  uuid: string;
+  session_id: string;
+}
+
+export type CLISystemMessage =
+  | CLISystemInitMessage
+  | CLISystemStatusMessage
+  | CLICompactBoundaryMessage
+  | CLITaskNotificationMessage
+  | CLIFilesPersistedMessage
+  | CLIHookStartedMessage
+  | CLIHookProgressMessage
+  | CLIHookResponseMessage;
+
 export interface CLIAssistantMessage {
   type: "assistant";
   message: {
@@ -136,15 +216,25 @@ export interface CLIAuthStatusMessage {
   session_id: string;
 }
 
+export interface CLIControlResponseMessage {
+  type: "control_response";
+  response: {
+    subtype: "success" | "error";
+    request_id: string;
+    response?: Record<string, unknown>;
+    error?: string;
+  };
+}
+
 export type CLIMessage =
-  | CLISystemInitMessage
-  | CLISystemStatusMessage
+  | CLISystemMessage
   | CLIAssistantMessage
   | CLIResultMessage
   | CLIStreamEventMessage
   | CLIToolProgressMessage
   | CLIToolUseSummaryMessage
   | CLIControlRequestMessage
+  | CLIControlResponseMessage
   | CLIKeepAliveMessage
   | CLIAuthStatusMessage;
 
@@ -160,18 +250,35 @@ export type ContentBlock =
 
 /** Messages the browser sends to the bridge */
 export type BrowserOutgoingMessage =
-  | { type: "user_message"; content: string; session_id?: string; images?: { media_type: string; data: string }[] }
-  | { type: "permission_response"; request_id: string; behavior: "allow" | "deny"; updated_input?: Record<string, unknown>; updated_permissions?: PermissionUpdate[]; message?: string }
-  | { type: "interrupt" }
-  | { type: "set_model"; model: string }
-  | { type: "set_permission_mode"; mode: string };
+  | { type: "user_message"; content: string; session_id?: string; images?: { media_type: string; data: string }[]; client_msg_id?: string }
+  | { type: "permission_response"; request_id: string; behavior: "allow" | "deny"; updated_input?: Record<string, unknown>; updated_permissions?: PermissionUpdate[]; message?: string; client_msg_id?: string }
+  | { type: "session_subscribe"; last_seq: number }
+  | { type: "session_ack"; last_seq: number }
+  | { type: "interrupt"; client_msg_id?: string }
+  | { type: "set_model"; model: string; client_msg_id?: string }
+  | { type: "set_permission_mode"; mode: string; client_msg_id?: string }
+  | { type: "mcp_get_status"; client_msg_id?: string }
+  | { type: "mcp_toggle"; serverName: string; enabled: boolean; client_msg_id?: string }
+  | { type: "mcp_reconnect"; serverName: string; client_msg_id?: string }
+  | { type: "mcp_set_servers"; servers: Record<string, McpServerConfig>; client_msg_id?: string };
 
 /** Messages the bridge sends to the browser */
-export type BrowserIncomingMessage =
+export type BrowserIncomingMessageBase =
   | { type: "session_init"; session: SessionState }
   | { type: "session_update"; session: Partial<SessionState> }
-  | { type: "assistant"; message: CLIAssistantMessage["message"]; parent_tool_use_id: string | null }
+  | { type: "assistant"; message: CLIAssistantMessage["message"]; parent_tool_use_id: string | null; timestamp?: number }
   | { type: "stream_event"; event: unknown; parent_tool_use_id: string | null }
+  | {
+    type: "system_event";
+    event:
+      | Pick<CLICompactBoundaryMessage, "subtype" | "compact_metadata" | "uuid" | "session_id">
+      | Pick<CLITaskNotificationMessage, "subtype" | "task_id" | "status" | "output_file" | "summary" | "uuid" | "session_id">
+      | Pick<CLIFilesPersistedMessage, "subtype" | "files" | "failed" | "processed_at" | "uuid" | "session_id">
+      | Pick<CLIHookStartedMessage, "subtype" | "hook_id" | "hook_name" | "hook_event" | "uuid" | "session_id">
+      | Pick<CLIHookProgressMessage, "subtype" | "hook_id" | "hook_name" | "hook_event" | "stdout" | "stderr" | "output" | "uuid" | "session_id">
+      | Pick<CLIHookResponseMessage, "subtype" | "hook_id" | "hook_name" | "hook_event" | "output" | "stdout" | "stderr" | "exit_code" | "outcome" | "uuid" | "session_id">;
+    timestamp?: number;
+  }
   | { type: "result"; data: CLIResultMessage }
   | { type: "permission_request"; request: PermissionRequest }
   | { type: "permission_cancelled"; request_id: string }
@@ -182,14 +289,29 @@ export type BrowserIncomingMessage =
   | { type: "error"; message: string }
   | { type: "cli_disconnected" }
   | { type: "cli_connected" }
-  | { type: "user_message"; content: string; timestamp: number }
+  | { type: "user_message"; content: string; timestamp: number; id?: string }
   | { type: "message_history"; messages: BrowserIncomingMessage[] }
-  | { type: "session_name_update"; name: string };
+  | { type: "event_replay"; events: BufferedBrowserEvent[] }
+  | { type: "session_name_update"; name: string }
+  | { type: "pr_status_update"; pr: import("./github-pr.js").GitHubPRInfo | null; available: boolean }
+  | { type: "mcp_status"; servers: McpServerDetail[] };
+
+export type BrowserIncomingMessage = BrowserIncomingMessageBase & { seq?: number };
+
+export type ReplayableBrowserIncomingMessage = Exclude<BrowserIncomingMessageBase, { type: "event_replay" }>;
+
+export interface BufferedBrowserEvent {
+  seq: number;
+  message: ReplayableBrowserIncomingMessage;
+}
 
 // ─── Session State ────────────────────────────────────────────────────────────
 
+export type BackendType = "claude" | "codex";
+
 export interface SessionState {
   session_id: string;
+  backend_type?: BackendType;
   model: string;
   cwd: string;
   tools: string[];
@@ -205,11 +327,53 @@ export interface SessionState {
   is_compacting: boolean;
   git_branch: string;
   is_worktree: boolean;
+  is_containerized: boolean;
   repo_root: string;
   git_ahead: number;
   git_behind: number;
   total_lines_added: number;
   total_lines_removed: number;
+  // Codex-specific token details (forwarded from thread/tokenUsage/updated)
+  codex_token_details?: {
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+    reasoningOutputTokens: number;
+    modelContextWindow: number;
+  };
+  // Codex-specific rate limits (forwarded from account/rateLimits/updated)
+  codex_rate_limits?: {
+    primary: { usedPercent: number; windowDurationMins: number; resetsAt: number } | null;
+    secondary: { usedPercent: number; windowDurationMins: number; resetsAt: number } | null;
+  };
+  /** If this session was spawned by a cron job */
+  cronJobId?: string;
+  /** Human-readable name of the cron job that spawned this session */
+  cronJobName?: string;
+  /** If this session was spawned by an agent */
+  agentId?: string;
+  /** Human-readable name of the agent that spawned this session */
+  agentName?: string;
+}
+
+// ─── MCP Types ───────────────────────────────────────────────────────────────
+
+export interface McpServerConfig {
+  type: "stdio" | "sse" | "http" | "sdk";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+}
+
+export interface McpServerDetail {
+  name: string;
+  status: "connected" | "failed" | "disabled" | "connecting";
+  serverInfo?: unknown;
+  error?: string;
+  config: { type: string; url?: string; command?: string; args?: string[] };
+  scope: string;
+  tools?: { name: string; annotations?: { readOnly?: boolean; destructive?: boolean; openWorld?: boolean } }[];
 }
 
 // ─── Permission Request ──────────────────────────────────────────────────────
@@ -235,4 +399,26 @@ export interface PermissionRequest {
   tool_use_id: string;
   agent_id?: string;
   timestamp: number;
+}
+
+// ─── Session Creation Progress (SSE streaming) ──────────────────────────────
+
+export type CreationStepId =
+  | "resolving_env"
+  | "fetching_git"
+  | "checkout_branch"
+  | "pulling_git"
+  | "creating_worktree"
+  | "pulling_image"
+  | "building_image"
+  | "creating_container"
+  | "copying_workspace"
+  | "running_init_script"
+  | "launching_cli";
+
+export interface CreationProgressEvent {
+  step: CreationStepId;
+  label: string;
+  status: "in_progress" | "done" | "error";
+  detail?: string;
 }

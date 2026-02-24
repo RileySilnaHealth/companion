@@ -8,5 +8,10 @@ package-lock.json
 test-live.ts
 web/dist/
 .env
+web/.env.local
 .dev-*.pid
 .dev-*.log
+docs/mocks/
+docs/repo-only/
+scripts/test-codex-*.ts
+web/dev-dist/

@@ -6,6 +6,7 @@ vi.mock("node:crypto", () => ({ randomUUID: () => "test-uuid" }));
 
 import { WsBridge, type SocketData } from "./ws-bridge.js";
 import { SessionStore } from "./session-store.js";
+import { containerManager } from "./container-manager.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -50,7 +51,7 @@ function makeInitMsg(overrides: Record<string, unknown> = {}) {
     type: "system",
     subtype: "init",
     session_id: "cli-123",
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6",
     cwd: "/test",
     tools: ["Bash", "Read"],
     permissionMode: "default",
@@ -83,6 +84,7 @@ describe("Session management", () => {
     expect(session.state.is_compacting).toBe(false);
     expect(session.state.git_branch).toBe("");
     expect(session.state.is_worktree).toBe(false);
+    expect(session.state.is_containerized).toBe(false);
     expect(session.state.repo_root).toBe("");
     expect(session.state.git_ahead).toBe(0);
     expect(session.state.git_behind).toBe(0);
@@ -99,6 +101,34 @@ describe("Session management", () => {
     const second = bridge.getOrCreateSession("s1");
     expect(second).toBe(first);
     expect(second.state.model).toBe("modified");
+  });
+
+  it("getOrCreateSession: sets backendType when creating a new session", () => {
+    const session = bridge.getOrCreateSession("s1", "codex");
+    expect(session.backendType).toBe("codex");
+    expect(session.state.backend_type).toBe("codex");
+  });
+
+  it("getOrCreateSession: does NOT overwrite backendType when called without explicit type", () => {
+    // Simulate: attachCodexAdapter creates session as "codex"
+    const session = bridge.getOrCreateSession("s1", "codex");
+    expect(session.backendType).toBe("codex");
+    expect(session.state.backend_type).toBe("codex");
+
+    // Simulate: handleBrowserOpen calls getOrCreateSession without backendType
+    const same = bridge.getOrCreateSession("s1");
+    expect(same.backendType).toBe("codex");
+    expect(same.state.backend_type).toBe("codex");
+  });
+
+  it("getOrCreateSession: overwrites backendType when explicitly provided on existing session", () => {
+    const session = bridge.getOrCreateSession("s1");
+    expect(session.backendType).toBe("claude");
+
+    // Explicit override (e.g. attachCodexAdapter)
+    bridge.getOrCreateSession("s1", "codex");
+    expect(session.backendType).toBe("codex");
+    expect(session.state.backend_type).toBe("codex");
   });
 
   it("getSession: returns undefined for unknown session", () => {
@@ -167,11 +197,14 @@ describe("CLI handlers", () => {
 
     // Should have broadcast cli_connected
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
-    expect(calls).toContainEqual({ type: "cli_connected" });
+    expect(calls).toContainEqual(expect.objectContaining({ type: "cli_connected" }));
   });
 
-  it("handleCLIOpen: flushes pending messages", () => {
-    // Send a user message before CLI connects
+  it("handleCLIOpen: flushes pending messages immediately", () => {
+    // Per the SDK protocol, the first user message triggers system.init,
+    // so queued messages must be flushed as soon as the CLI WebSocket connects
+    // (not deferred until system.init, which would create a deadlock for
+    // slow-starting sessions like Docker containers).
     const browser = makeBrowserSocket("s1");
     bridge.handleBrowserOpen(browser, "s1");
 
@@ -184,7 +217,7 @@ describe("CLI handlers", () => {
     const session = bridge.getSession("s1")!;
     expect(session.pendingMessages.length).toBe(1);
 
-    // Now connect CLI
+    // Now connect CLI — messages should be flushed immediately
     const cli = makeCliSocket("s1");
     bridge.handleCLIOpen(cli, "s1");
 
@@ -192,10 +225,43 @@ describe("CLI handlers", () => {
     expect(session.pendingMessages).toEqual([]);
     // The CLI socket should have received the queued message
     expect(cli.send).toHaveBeenCalled();
-    const sentData = cli.send.mock.calls[0][0] as string;
-    const parsed = JSON.parse(sentData.trim());
+    const sentCalls = cli.send.mock.calls.map(([arg]: [string]) => arg);
+    const userMsg = sentCalls.find((s: string) => s.includes('"type":"user"'));
+    expect(userMsg).toBeDefined();
+    const parsed = JSON.parse(userMsg!.trim());
     expect(parsed.type).toBe("user");
     expect(parsed.message.content).toBe("hello queued");
+  });
+
+  it("handleCLIMessage: system.init does not re-flush already-sent messages", () => {
+    // Messages are flushed on CLI connect, so by the time system.init
+    // arrives the queue should already be empty.
+    mockExecSync.mockImplementation(() => { throw new Error("not a git repo"); });
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "user_message",
+      content: "hello queued",
+    }));
+
+    const session = bridge.getSession("s1")!;
+    expect(session.pendingMessages.length).toBe(1);
+
+    // Connect CLI — messages flushed immediately
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    expect(session.pendingMessages).toEqual([]);
+    const sendCountAfterOpen = cli.send.mock.calls.length;
+
+    // Send system.init — no additional flush should happen
+    bridge.handleCLIMessage(cli, makeInitMsg());
+
+    // Verify no additional user messages were sent after system.init
+    const newCalls = cli.send.mock.calls.slice(sendCountAfterOpen);
+    const userMsgAfterInit = newCalls.find(([arg]: [string]) => arg.includes('"type":"user"'));
+    expect(userMsgAfterInit).toBeUndefined();
   });
 
   it("handleCLIMessage: parses NDJSON and routes system.init", () => {
@@ -212,14 +278,14 @@ describe("CLI handlers", () => {
     bridge.handleCLIMessage(cli, makeInitMsg());
 
     const session = bridge.getSession("s1")!;
-    expect(session.state.model).toBe("claude-sonnet-4-5-20250929");
+    expect(session.state.model).toBe("claude-sonnet-4-6");
     expect(session.state.cwd).toBe("/test");
 
     // Should broadcast session_init to browser
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
     const initCall = calls.find((c: any) => c.type === "session_init");
     expect(initCall).toBeDefined();
-    expect(initCall.session.model).toBe("claude-sonnet-4-5-20250929");
+    expect(initCall.session.model).toBe("claude-sonnet-4-6");
   });
 
   it("handleCLIMessage: system.init fires onCLISessionIdReceived callback", () => {
@@ -269,10 +335,121 @@ describe("CLI handlers", () => {
     expect(state.skills).toEqual(["pdf"]);
   });
 
+  it("handleCLIMessage: system.init preserves host cwd for containerized sessions", () => {
+    // markContainerized sets the host cwd and is_containerized before CLI connects
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+
+    mockExecSync.mockImplementation(() => {
+      throw new Error("container not tracked");
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    // CLI inside the container reports /workspace — should be ignored
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.cwd).toBe("/Users/stan/Dev/myproject");
+    expect(state.is_containerized).toBe(true);
+  });
+
+  it("handleCLIMessage: keeps previous git info when container metadata is temporarily unavailable", () => {
+    const session = bridge.getOrCreateSession("s1");
+    session.state.git_branch = "existing-branch";
+    session.state.repo_root = "/workspace";
+    session.state.git_ahead = 2;
+    session.state.git_behind = 1;
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+
+    mockExecSync.mockImplementation(() => {
+      throw new Error("container not tracked");
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.git_branch).toBe("existing-branch");
+    expect(state.repo_root).toBe("/workspace");
+    expect(state.git_ahead).toBe(2);
+    expect(state.git_behind).toBe(1);
+  });
+
+  it("handleCLIMessage: resolves git info from container for containerized sessions", () => {
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+    const getContainerSpy = vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "abc123def456",
+      name: "companion-test",
+      image: "the-companion:latest",
+      portMappings: [],
+      hostCwd: "/Users/stan/Dev/myproject",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (!cmd.startsWith("docker exec abc123def456 sh -lc ")) {
+        throw new Error(`unexpected command: ${cmd}`);
+      }
+      if (cmd.includes("--abbrev-ref HEAD")) return "container-branch\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/workspace\n";
+      if (cmd.includes("--left-right --count")) return "1\t3\n";
+      throw new Error(`unknown git cmd: ${cmd}`);
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.cwd).toBe("/Users/stan/Dev/myproject");
+    expect(state.git_branch).toBe("container-branch");
+    expect(state.repo_root).toBe("/Users/stan/Dev/myproject");
+    expect(state.git_behind).toBe(1);
+    expect(state.git_ahead).toBe(3);
+    expect(getContainerSpy).toHaveBeenCalledWith("s1");
+    getContainerSpy.mockRestore();
+  });
+
+  it("handleCLIMessage: maps nested container repo_root paths back to host paths", () => {
+    bridge.markContainerized("s1", "/Users/stan/Dev/myproject");
+    const getContainerSpy = vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "abc123def456",
+      name: "companion-test",
+      image: "the-companion:latest",
+      portMappings: [],
+      hostCwd: "/Users/stan/Dev/myproject",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (!cmd.startsWith("docker exec abc123def456 sh -lc ")) {
+        throw new Error(`unexpected command: ${cmd}`);
+      }
+      if (cmd.includes("--abbrev-ref HEAD")) return "container-branch\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/workspace/packages/api\n";
+      if (cmd.includes("--left-right --count")) return "0\t0\n";
+      throw new Error(`unknown git cmd: ${cmd}`);
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/workspace" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.repo_root).toBe("/Users/stan/Dev/myproject/packages/api");
+    expect(getContainerSpy).toHaveBeenCalledWith("s1");
+    getContainerSpy.mockRestore();
+  });
+
   it("handleCLIMessage: system.init resolves git info via execSync", () => {
     mockExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("--abbrev-ref HEAD")) return "feat/test-branch\n";
-      if (cmd.includes("--git-dir")) return "/repo/.git/worktrees/feat-test\n";
       if (cmd.includes("--show-toplevel")) return "/repo\n";
       if (cmd.includes("--left-right --count")) return "2\t5\n";
       throw new Error("unknown git cmd");
@@ -284,10 +461,26 @@ describe("CLI handlers", () => {
 
     const state = bridge.getSession("s1")!.state;
     expect(state.git_branch).toBe("feat/test-branch");
-    expect(state.is_worktree).toBe(true);
     expect(state.repo_root).toBe("/repo");
     expect(state.git_ahead).toBe(5);
     expect(state.git_behind).toBe(2);
+  });
+
+  it("handleCLIMessage: system.init resolves repo_root via --show-toplevel for standard repo", () => {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("--abbrev-ref HEAD")) return "main\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/home/user/myproject\n";
+      if (cmd.includes("--left-right --count")) return "0\t0\n";
+      throw new Error("unknown git cmd");
+    });
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg({ cwd: "/home/user/myproject" }));
+
+    const state = bridge.getSession("s1")!.state;
+    expect(state.repo_root).toBe("/home/user/myproject");
   });
 
   it("handleCLIMessage: system.status updates compacting and permissionMode", () => {
@@ -313,7 +506,66 @@ describe("CLI handlers", () => {
     expect(state.permissionMode).toBe("plan");
 
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
-    expect(calls).toContainEqual({ type: "status_change", status: "compacting" });
+    expect(calls).toContainEqual(expect.objectContaining({ type: "status_change", status: "compacting" }));
+  });
+
+  it("handleCLIMessage: forwards compact_boundary as system_event and persists it", () => {
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "auto", pre_tokens: 4096 },
+      uuid: "uuid-compact",
+      session_id: "s1",
+    }));
+
+    const session = bridge.getSession("s1")!;
+    expect(session.messageHistory).toHaveLength(1);
+    expect(session.messageHistory[0]).toMatchObject({
+      type: "system_event",
+      event: {
+        subtype: "compact_boundary",
+      },
+    });
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const forwarded = calls.find((c: any) => c.type === "system_event");
+    expect(forwarded).toBeDefined();
+    expect(forwarded.event.subtype).toBe("compact_boundary");
+  });
+
+  it("handleCLIMessage: forwards hook_progress as system_event without persisting history", () => {
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "system",
+      subtype: "hook_progress",
+      hook_id: "hk-1",
+      hook_name: "lint",
+      hook_event: "post_tool_use",
+      stdout: "running",
+      stderr: "",
+      output: "running",
+      uuid: "uuid-hook-progress",
+      session_id: "s1",
+    }));
+
+    const session = bridge.getSession("s1")!;
+    expect(session.messageHistory).toHaveLength(0);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const forwarded = calls.find((c: any) => c.type === "system_event");
+    expect(forwarded).toBeDefined();
+    expect(forwarded.event.subtype).toBe("hook_progress");
   });
 
   it("handleCLIClose: nulls cliSocket and broadcasts cli_disconnected", () => {
@@ -330,7 +582,7 @@ describe("CLI handlers", () => {
     expect(bridge.isCliConnected("s1")).toBe(false);
 
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
-    expect(calls).toContainEqual({ type: "cli_disconnected" });
+    expect(calls).toContainEqual(expect.objectContaining({ type: "cli_disconnected" }));
   });
 
   it("handleCLIClose: cancels pending permissions", () => {
@@ -383,6 +635,31 @@ describe("Browser handlers", () => {
     expect(firstMsg.session.session_id).toBe("s1");
   });
 
+  it("handleBrowserOpen: refreshes git branch before sending session snapshot", () => {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("--abbrev-ref HEAD")) return "feat/dynamic-branch\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/repo\n";
+      if (cmd.includes("--left-right --count")) return "0\t0\n";
+      throw new Error("unknown git cmd");
+    });
+
+    const session = bridge.getOrCreateSession("s1");
+    session.state.cwd = "/repo";
+    session.state.git_branch = "main";
+
+    const gitInfoCb = vi.fn();
+    bridge.onSessionGitInfoReadyCallback(gitInfoCb);
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    const firstMsg = JSON.parse(browser.send.mock.calls[0][0]);
+    expect(firstMsg.type).toBe("session_init");
+    expect(firstMsg.session.git_branch).toBe("feat/dynamic-branch");
+    expect(gitInfoCb).toHaveBeenCalledWith("s1", "/repo", "feat/dynamic-branch");
+  });
+
   it("handleBrowserOpen: replays message history", () => {
     // First populate some history
     mockExecSync.mockImplementation(() => {
@@ -398,7 +675,7 @@ describe("Browser handlers", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "Hello!" }],
         stop_reason: null,
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -464,6 +741,23 @@ describe("Browser handlers", () => {
     expect(disconnectedMsg).toBeDefined();
   });
 
+  it("handleBrowserOpen: does NOT relaunch when Codex adapter is attached but still initializing", () => {
+    const relaunchCb = vi.fn();
+    bridge.onCLIRelaunchNeededCallback(relaunchCb);
+
+    const session = bridge.getOrCreateSession("s1", "codex");
+    session.codexAdapter = { isConnected: () => false } as any;
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    expect(relaunchCb).not.toHaveBeenCalled();
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const disconnectedMsg = calls.find((c: any) => c.type === "cli_disconnected");
+    expect(disconnectedMsg).toBeUndefined();
+  });
+
   it("handleBrowserClose: removes from set", () => {
     const browser = makeBrowserSocket("s1");
     bridge.handleBrowserOpen(browser, "s1");
@@ -471,6 +765,254 @@ describe("Browser handlers", () => {
 
     bridge.handleBrowserClose(browser);
     expect(bridge.getSession("s1")!.browserSockets.has(browser)).toBe(false);
+  });
+
+  it("session_subscribe: replays buffered sequenced events after last_seq", () => {
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    // Generate replayable events while no browser is connected.
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "a" } },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "b" } },
+      parent_tool_use_id: null,
+      uuid: "u2",
+      session_id: "s1",
+    }));
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    // Ask for replay after seq=1 (cli_connected). Both stream events should replay.
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 1,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const replay = calls.find((c: any) => c.type === "event_replay");
+    expect(replay).toBeDefined();
+    expect(replay.events).toHaveLength(2);
+    expect(replay.events[0].seq).toBe(2);
+    expect(replay.events[0].message.type).toBe("stream_event");
+  });
+
+  it("session_subscribe: falls back to message_history when last_seq is older than buffer window", () => {
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    // Populate history so fallback payload has content.
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "hist-1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "from history" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "hist-u1",
+      session_id: "s1",
+    }));
+
+    // Generate several stream events, then trim the first one from in-memory buffer.
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "1" } },
+      parent_tool_use_id: null,
+      uuid: "se-u1",
+      session_id: "s1",
+    }));
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "2" } },
+      parent_tool_use_id: null,
+      uuid: "se-u2",
+      session_id: "s1",
+    }));
+    const session = bridge.getSession("s1")!;
+    session.eventBuffer.shift();
+    session.eventBuffer.shift(); // force earliest seq high enough to create a gap for last_seq=1
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 1,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const historyMsg = calls.find((c: any) => c.type === "message_history");
+    expect(historyMsg).toBeDefined();
+    expect(historyMsg.messages.some((m: any) => m.type === "assistant")).toBe(true);
+    const replayMsg = calls.find((c: any) => c.type === "event_replay");
+    expect(replayMsg).toBeDefined();
+    expect(replayMsg.events.some((e: any) => e.message.type === "stream_event")).toBe(true);
+  });
+
+  it("session_subscribe: sends ground-truth status_change=idle after event_replay when last history is result", () => {
+    // When the CLI finished (result in messageHistory), the server should send
+    // a status_change after event_replay so the browser clears stale "running" state.
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    // Simulate a completed turn: assistant → result in history
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "a1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "hello" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "result",
+      is_error: false,
+      total_cost_usd: 0.01,
+      num_turns: 1,
+      session_id: "s1",
+    }));
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 0,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    // Last message should be a status_change with idle
+    const statusMsg = calls.filter((c: any) => c.type === "status_change");
+    expect(statusMsg.length).toBeGreaterThanOrEqual(1);
+    const lastStatus = statusMsg[statusMsg.length - 1];
+    expect(lastStatus.status).toBe("idle");
+  });
+
+  it("session_subscribe: sends ground-truth status_change=running after event_replay when last history is assistant", () => {
+    // When the CLI is mid-turn (assistant in messageHistory but no result yet),
+    // the ground-truth status should be "running".
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "a1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "working on it" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 0,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const statusMsg = calls.filter((c: any) => c.type === "status_change");
+    expect(statusMsg.length).toBeGreaterThanOrEqual(1);
+    const lastStatus = statusMsg[statusMsg.length - 1];
+    expect(lastStatus.status).toBe("running");
+  });
+
+  it("session_subscribe: sends status_change=idle in gap path when session completed", () => {
+    // Even when falling back to message_history + transient replay,
+    // a trailing status_change should correct stale state.
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "a1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "done" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    }));
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "result",
+      is_error: false,
+      total_cost_usd: 0.01,
+      num_turns: 1,
+      session_id: "s1",
+    }));
+    // Add a stream event and then force a gap by trimming the buffer
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "x" } },
+      parent_tool_use_id: null,
+      uuid: "se1",
+      session_id: "s1",
+    }));
+    const session = bridge.getSession("s1")!;
+    session.eventBuffer.shift(); // force a gap
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_subscribe",
+      last_seq: 1,
+    }));
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const statusMsg = calls.filter((c: any) => c.type === "status_change");
+    expect(statusMsg.length).toBeGreaterThanOrEqual(1);
+    expect(statusMsg[statusMsg.length - 1].status).toBe("idle");
+  });
+
+  it("session_ack: updates lastAckSeq for the session", () => {
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "session_ack",
+      last_seq: 42,
+    }));
+
+    const session = bridge.getSession("s1")!;
+    expect(session.lastAckSeq).toBe(42);
   });
 });
 
@@ -495,7 +1037,7 @@ describe("CLI message routing", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "Hello world!" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -554,6 +1096,44 @@ describe("CLI message routing", () => {
     expect(resultBroadcast.data.total_cost_usd).toBe(0.05);
   });
 
+  it("result: refreshes git branch and broadcasts session_update when branch changes", () => {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("--abbrev-ref HEAD")) return "feat/new-branch\n";
+      if (cmd.includes("--git-dir")) return ".git\n";
+      if (cmd.includes("--show-toplevel")) return "/test\n";
+      if (cmd.includes("--left-right --count")) return "0\t1\n";
+      throw new Error("unknown git cmd");
+    });
+
+    const session = bridge.getSession("s1")!;
+    session.state.cwd = "/test";
+    session.state.git_branch = "main";
+
+    const msg = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Done!",
+      duration_ms: 5000,
+      duration_api_ms: 4000,
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      stop_reason: "end_turn",
+      usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      uuid: "uuid-refresh-git",
+      session_id: "s1",
+    });
+
+    bridge.handleCLIMessage(cli, msg);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const updateMsg = calls.find((c: any) => c.type === "session_update");
+    expect(updateMsg).toBeDefined();
+    expect(updateMsg.session.git_branch).toBe("feat/new-branch");
+    expect(updateMsg.session.git_ahead).toBe(1);
+    expect(bridge.getSession("s1")!.state.git_branch).toBe("feat/new-branch");
+  });
+
   it("result: computes context_used_percent from modelUsage", () => {
     const msg = JSON.stringify({
       type: "result",
@@ -566,7 +1146,7 @@ describe("CLI message routing", () => {
       stop_reason: "end_turn",
       usage: { input_tokens: 500, output_tokens: 200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
       modelUsage: {
-        "claude-sonnet-4-5-20250929": {
+        "claude-sonnet-4-6": {
           inputTokens: 8000,
           outputTokens: 2000,
           cacheReadInputTokens: 0,
@@ -784,6 +1364,22 @@ describe("Browser message routing", () => {
     expect(queued.message.content).toBe("queued message");
   });
 
+  it("user_message: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "user_message",
+      content: "once only",
+      client_msg_id: "client-msg-1",
+    };
+
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
+    const session = bridge.getSession("s1")!;
+    const userMessages = session.messageHistory.filter((m) => m.type === "user_message");
+    expect(userMessages).toHaveLength(1);
+  });
+
   it("user_message with images: builds content blocks", () => {
     bridge.handleBrowserMessage(browser, JSON.stringify({
       type: "user_message",
@@ -877,6 +1473,33 @@ describe("Browser message routing", () => {
     expect(session.pendingPermissions.has("req-deny")).toBe(false);
   });
 
+  it("permission_response: deduplicates repeated client_msg_id", () => {
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "control_request",
+      request_id: "req-dedupe",
+      request: {
+        subtype: "can_use_tool",
+        tool_name: "Bash",
+        input: { command: "echo hi" },
+        tool_use_id: "tu-dedupe",
+      },
+    }));
+    cli.send.mockClear();
+
+    const payload = {
+      type: "permission_response",
+      request_id: "req-dedupe",
+      behavior: "allow",
+      client_msg_id: "perm-msg-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
+    const session = bridge.getSession("s1")!;
+    expect(session.pendingPermissions.has("req-dedupe")).toBe(false);
+  });
+
   it("interrupt: sends control_request with interrupt subtype to CLI", () => {
     bridge.handleBrowserMessage(browser, JSON.stringify({
       type: "interrupt",
@@ -888,6 +1511,14 @@ describe("Browser message routing", () => {
     expect(sent.type).toBe("control_request");
     expect(sent.request_id).toBe("test-uuid");
     expect(sent.request.subtype).toBe("interrupt");
+  });
+
+  it("interrupt: deduplicates repeated client_msg_id", () => {
+    const payload = { type: "interrupt", client_msg_id: "ctrl-msg-1" };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
   });
 
   it("set_model: sends control_request with set_model subtype to CLI", () => {
@@ -919,6 +1550,80 @@ describe("Browser message routing", () => {
     expect(sent.request.subtype).toBe("set_permission_mode");
     expect(sent.request.mode).toBe("bypassPermissions");
   });
+
+  it("set_model: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "set_model",
+      model: "claude-opus-4-5-20250929",
+      client_msg_id: "set-model-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    expect(cli.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("set_permission_mode: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "set_permission_mode",
+      mode: "plan",
+      client_msg_id: "set-mode-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    expect(cli.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("mcp_toggle: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "mcp_toggle",
+      serverName: "my-mcp",
+      enabled: true,
+      client_msg_id: "mcp-msg-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+
+    // 1 send for mcp_toggle control_request + delayed status refresh timer not run in this assertion window.
+    expect(cli.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("mcp_get_status: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "mcp_get_status",
+      client_msg_id: "mcp-status-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    expect(cli.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("mcp_reconnect: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "mcp_reconnect",
+      serverName: "my-mcp",
+      client_msg_id: "mcp-reconnect-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    expect(cli.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("mcp_set_servers: deduplicates repeated client_msg_id", () => {
+    const payload = {
+      type: "mcp_set_servers",
+      servers: {
+        "server-a": {
+          type: "stdio",
+          command: "node",
+          args: ["server.js"],
+        },
+      },
+      client_msg_id: "mcp-set-servers-1",
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    bridge.handleBrowserMessage(browser, JSON.stringify(payload));
+    expect(cli.send).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
@@ -930,7 +1635,7 @@ describe("Persistence", () => {
       id: "persisted-1",
       state: {
         session_id: "persisted-1",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/saved",
         tools: ["Bash"],
         permissionMode: "default",
@@ -945,6 +1650,7 @@ describe("Persistence", () => {
         is_compacting: false,
         git_branch: "main",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "/saved",
         git_ahead: 0,
         git_behind: 0,
@@ -956,6 +1662,7 @@ describe("Persistence", () => {
       ],
       pendingMessages: [],
       pendingPermissions: [],
+      processedClientMessageIds: ["restored-client-1"],
     });
 
     const count = bridge.restoreFromDisk();
@@ -963,12 +1670,13 @@ describe("Persistence", () => {
 
     const session = bridge.getSession("persisted-1");
     expect(session).toBeDefined();
-    expect(session!.state.model).toBe("claude-sonnet-4-5-20250929");
+    expect(session!.state.model).toBe("claude-sonnet-4-6");
     expect(session!.state.cwd).toBe("/saved");
     expect(session!.state.total_cost_usd).toBe(0.1);
     expect(session!.messageHistory).toHaveLength(1);
     expect(session!.cliSocket).toBeNull();
     expect(session!.browserSockets.size).toBe(0);
+    expect(session!.processedClientMessageIdSet.has("restored-client-1")).toBe(true);
   });
 
   it("restoreFromDisk: does not overwrite live sessions", () => {
@@ -996,6 +1704,7 @@ describe("Persistence", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -1031,7 +1740,7 @@ describe("Persistence", () => {
 
     const lastCall = saveSpy.mock.calls[saveSpy.mock.calls.length - 1][0];
     expect(lastCall.id).toBe("s1");
-    expect(lastCall.state.model).toBe("claude-sonnet-4-5-20250929");
+    expect(lastCall.state.model).toBe("claude-sonnet-4-6");
 
     saveSpy.mockClear();
 
@@ -1042,7 +1751,7 @@ describe("Persistence", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         content: [{ type: "text", text: "Test" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -1655,7 +2364,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "perm-session",
       state: {
         session_id: "perm-session",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: ["Bash", "Edit"],
         permissionMode: "default",
@@ -1670,6 +2379,7 @@ describe("Restore from disk with pendingPermissions", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -1705,7 +2415,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "perm-replay",
       state: {
         session_id: "perm-replay",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: ["Bash"],
         permissionMode: "default",
@@ -1720,6 +2430,7 @@ describe("Restore from disk with pendingPermissions", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -1762,7 +2473,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "empty-perms",
       state: {
         session_id: "empty-perms",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -1777,6 +2488,7 @@ describe("Restore from disk with pendingPermissions", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -1802,7 +2514,7 @@ describe("Restore from disk with pendingPermissions", () => {
       id: "no-perms-field",
       state: {
         session_id: "no-perms-field",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -1817,6 +2529,7 @@ describe("Restore from disk with pendingPermissions", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -2232,7 +2945,7 @@ describe("onFirstTurnCompletedCallback", () => {
       id: "restored-1",
       state: {
         session_id: "restored-1",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -2247,6 +2960,7 @@ describe("onFirstTurnCompletedCallback", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -2294,7 +3008,7 @@ describe("onFirstTurnCompletedCallback", () => {
       id: "fresh-restored",
       state: {
         session_id: "fresh-restored",
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6",
         cwd: "/test",
         tools: [],
         permissionMode: "default",
@@ -2309,6 +3023,7 @@ describe("onFirstTurnCompletedCallback", () => {
         is_compacting: false,
         git_branch: "",
         is_worktree: false,
+        is_containerized: false,
         repo_root: "",
         git_ahead: 0,
         git_behind: 0,
@@ -2365,13 +3080,171 @@ describe("broadcastNameUpdate", () => {
 
     bridge.broadcastNameUpdate("s1", "Fix Auth Bug");
 
-    const expected = JSON.stringify({ type: "session_name_update", name: "Fix Auth Bug" });
-    expect(browser1.send).toHaveBeenCalledWith(expected);
-    expect(browser2.send).toHaveBeenCalledWith(expected);
+    const calls1 = browser1.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    const calls2 = browser2.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls1).toContainEqual(expect.objectContaining({ type: "session_name_update", name: "Fix Auth Bug" }));
+    expect(calls2).toContainEqual(expect.objectContaining({ type: "session_name_update", name: "Fix Auth Bug" }));
   });
 
   it("does nothing for unknown sessions", () => {
     // Should not throw
     bridge.broadcastNameUpdate("nonexistent", "Name");
+  });
+});
+
+// ─── MCP Control Messages ────────────────────────────────────────────────────
+
+describe("MCP control messages", () => {
+  let cli: ReturnType<typeof makeCliSocket>;
+  let browser: ReturnType<typeof makeBrowserSocket>;
+
+  beforeEach(() => {
+    cli = makeCliSocket("s1");
+    browser = makeBrowserSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg());
+    cli.send.mockClear();
+    browser.send.mockClear();
+  });
+
+  it("mcp_get_status: sends mcp_status control_request to CLI", () => {
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "mcp_get_status",
+    }));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
+    const sentRaw = cli.send.mock.calls[0][0] as string;
+    const sent = JSON.parse(sentRaw.trim());
+    expect(sent.type).toBe("control_request");
+    expect(sent.request_id).toBe("test-uuid");
+    expect(sent.request.subtype).toBe("mcp_status");
+  });
+
+  it("mcp_toggle: sends mcp_toggle control_request to CLI", () => {
+    // Use vi.useFakeTimers to prevent the delayed mcp_get_status
+    vi.useFakeTimers();
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "mcp_toggle",
+      serverName: "my-server",
+      enabled: false,
+    }));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
+    const sentRaw = cli.send.mock.calls[0][0] as string;
+    const sent = JSON.parse(sentRaw.trim());
+    expect(sent.type).toBe("control_request");
+    expect(sent.request.subtype).toBe("mcp_toggle");
+    expect(sent.request.serverName).toBe("my-server");
+    expect(sent.request.enabled).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("mcp_reconnect: sends mcp_reconnect control_request to CLI", () => {
+    vi.useFakeTimers();
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "mcp_reconnect",
+      serverName: "failing-server",
+    }));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
+    const sentRaw = cli.send.mock.calls[0][0] as string;
+    const sent = JSON.parse(sentRaw.trim());
+    expect(sent.type).toBe("control_request");
+    expect(sent.request.subtype).toBe("mcp_reconnect");
+    expect(sent.request.serverName).toBe("failing-server");
+    vi.useRealTimers();
+  });
+
+  it("control_response for mcp_status: broadcasts mcp_status to browsers", () => {
+    // Send mcp_get_status to create the pending request
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "mcp_get_status",
+    }));
+    browser.send.mockClear();
+
+    // Simulate CLI responding with control_response
+    const mockServers = [
+      {
+        name: "test-server",
+        status: "connected",
+        config: { type: "stdio", command: "node", args: ["server.js"] },
+        scope: "project",
+        tools: [{ name: "myTool" }],
+      },
+    ];
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: "test-uuid",
+        response: { mcpServers: mockServers },
+      },
+    }));
+
+    expect(browser.send).toHaveBeenCalledTimes(1);
+    const browserMsg = JSON.parse(browser.send.mock.calls[0][0] as string);
+    expect(browserMsg.type).toBe("mcp_status");
+    expect(browserMsg.servers).toHaveLength(1);
+    expect(browserMsg.servers[0].name).toBe("test-server");
+    expect(browserMsg.servers[0].status).toBe("connected");
+    expect(browserMsg.servers[0].tools).toHaveLength(1);
+  });
+
+  it("control_response with error: does not broadcast to browsers", () => {
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "mcp_get_status",
+    }));
+    browser.send.mockClear();
+
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "control_response",
+      response: {
+        subtype: "error",
+        request_id: "test-uuid",
+        error: "MCP not available",
+      },
+    }));
+
+    // Should not broadcast anything
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("control_response for unknown request_id: ignored silently", () => {
+    bridge.handleCLIMessage(cli, JSON.stringify({
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: "unknown-id",
+        response: { mcpServers: [] },
+      },
+    }));
+
+    // Should not throw and not send anything
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("mcp_set_servers: sends mcp_set_servers control_request to CLI", () => {
+    vi.useFakeTimers();
+    const servers = {
+      "my-notes": {
+        type: "stdio" as const,
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-memory"],
+      },
+    };
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "mcp_set_servers",
+      servers,
+    }));
+
+    expect(cli.send).toHaveBeenCalledTimes(1);
+    const sentRaw = cli.send.mock.calls[0][0] as string;
+    const sent = JSON.parse(sentRaw.trim());
+    expect(sent.type).toBe("control_request");
+    expect(sent.request.subtype).toBe("mcp_set_servers");
+    expect(sent.request.servers).toEqual(servers);
+    vi.useRealTimers();
   });
 });

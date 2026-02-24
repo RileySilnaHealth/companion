@@ -1,10 +1,7 @@
 import type { ServerWebSocket } from "bun";
-import { randomUUID } from "node:crypto";
-import { execSync } from "node:child_process";
 import type {
   CLIMessage,
-  CLISystemInitMessage,
-  CLISystemStatusMessage,
+  CLISystemMessage,
   CLIAssistantMessage,
   CLIResultMessage,
   CLIStreamEventMessage,
@@ -16,71 +13,79 @@ import type {
   BrowserIncomingMessage,
   SessionState,
   PermissionRequest,
+  BackendType,
+  McpServerConfig,
 } from "./session-types.js";
 import type { SessionStore } from "./session-store.js";
-
-// ─── WebSocket data tags ──────────────────────────────────────────────────────
-
-interface CLISocketData {
-  kind: "cli";
-  sessionId: string;
-}
-
-interface BrowserSocketData {
-  kind: "browser";
-  sessionId: string;
-}
-
-export type SocketData = CLISocketData | BrowserSocketData;
-
-// ─── Session ──────────────────────────────────────────────────────────────────
-
-interface Session {
-  id: string;
-  cliSocket: ServerWebSocket<SocketData> | null;
-  browserSockets: Set<ServerWebSocket<SocketData>>;
-  state: SessionState;
-  pendingPermissions: Map<string, PermissionRequest>;
-  messageHistory: BrowserIncomingMessage[];
-  /** Messages queued while waiting for CLI to connect */
-  pendingMessages: string[];
-}
-
-function makeDefaultState(sessionId: string): SessionState {
-  return {
-    session_id: sessionId,
-    model: "",
-    cwd: "",
-    tools: [],
-    permissionMode: "default",
-    claude_code_version: "",
-    mcp_servers: [],
-    agents: [],
-    slash_commands: [],
-    skills: [],
-    total_cost_usd: 0,
-    num_turns: 0,
-    context_used_percent: 0,
-    is_compacting: false,
-    git_branch: "",
-    is_worktree: false,
-    repo_root: "",
-    git_ahead: 0,
-    git_behind: 0,
-    total_lines_added: 0,
-    total_lines_removed: 0,
-  };
-}
+import type { CodexAdapter } from "./codex-adapter.js";
+import type { RecorderManager } from "./recorder.js";
+import { resolveSessionGitInfo } from "./session-git-info.js";
+import type {
+  Session,
+  SocketData,
+  CLISocketData,
+  BrowserSocketData,
+  GitSessionKey,
+} from "./ws-bridge-types.js";
+import { makeDefaultState } from "./ws-bridge-types.js";
+export type { SocketData } from "./ws-bridge-types.js";
+import {
+  isDuplicateClientMessage,
+  rememberClientMessage,
+  isHistoryBackedEvent,
+  sequenceEvent,
+} from "./ws-bridge-replay.js";
+import { attachCodexAdapterHandlers } from "./ws-bridge-codex.js";
+import {
+  handleInterrupt,
+  handleSetModel,
+  handleSetPermissionMode,
+  handleControlResponse,
+  sendControlRequest,
+  handleMcpGetStatus,
+  handleMcpToggle,
+  handleMcpReconnect,
+  handleMcpSetServers,
+} from "./ws-bridge-controls.js";
+import {
+  handleSessionSubscribe,
+  handleSessionAck,
+  handlePermissionResponse,
+} from "./ws-bridge-browser.js";
 
 // ─── Bridge ───────────────────────────────────────────────────────────────────
 
 export class WsBridge {
+  private static readonly EVENT_BUFFER_LIMIT = 600;
+  private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
+  private static readonly IDEMPOTENT_BROWSER_MESSAGE_TYPES = new Set<string>([
+    "user_message",
+    "permission_response",
+    "interrupt",
+    "set_model",
+    "set_permission_mode",
+    "mcp_get_status",
+    "mcp_toggle",
+    "mcp_reconnect",
+    "mcp_set_servers",
+  ]);
   private sessions = new Map<string, Session>();
   private store: SessionStore | null = null;
+  private recorder: RecorderManager | null = null;
   private onCLISessionId: ((sessionId: string, cliSessionId: string) => void) | null = null;
   private onCLIRelaunchNeeded: ((sessionId: string) => void) | null = null;
   private onFirstTurnCompleted: ((sessionId: string, firstUserMessage: string) => void) | null = null;
   private autoNamingAttempted = new Set<string>();
+  private userMsgCounter = 0;
+  private onGitInfoReady: ((sessionId: string, cwd: string, branch: string) => void) | null = null;
+  private static readonly GIT_SESSION_KEYS: GitSessionKey[] = [
+    "git_branch",
+    "is_worktree",
+    "is_containerized",
+    "repo_root",
+    "git_ahead",
+    "git_behind",
+  ];
 
   /** Register a callback for when we learn the CLI's internal session ID. */
   onCLISessionIdReceived(cb: (sessionId: string, cliSessionId: string) => void): void {
@@ -97,9 +102,37 @@ export class WsBridge {
     this.onFirstTurnCompleted = cb;
   }
 
+  /** Register a callback for when git info is resolved and branch is known. */
+  onSessionGitInfoReadyCallback(cb: (sessionId: string, cwd: string, branch: string) => void): void {
+    this.onGitInfoReady = cb;
+  }
+
+  /**
+   * Pre-populate a session with container info so that handleSystemMessage
+   * preserves the host cwd instead of overwriting it with /workspace.
+   * Call this right after launcher.launch() for containerized sessions.
+   */
+  markContainerized(sessionId: string, hostCwd: string): void {
+    const session = this.getOrCreateSession(sessionId);
+    session.state.is_containerized = true;
+    session.state.cwd = hostCwd;
+  }
+
+  /** Push a message to all connected browsers for a session (public, for PRPoller etc.). */
+  broadcastToSession(sessionId: string, msg: BrowserIncomingMessage): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    this.broadcastToBrowsers(session, msg);
+  }
+
   /** Attach a persistent store. Call restoreFromDisk() after. */
   setStore(store: SessionStore): void {
     this.store = store;
+  }
+
+  /** Attach a recorder for raw message capture. */
+  setRecorder(recorder: RecorderManager): void {
+    this.recorder = recorder;
   }
 
   /** Restore sessions from disk (call once at startup). */
@@ -111,13 +144,26 @@ export class WsBridge {
       if (this.sessions.has(p.id)) continue; // don't overwrite live sessions
       const session: Session = {
         id: p.id,
+        backendType: p.state.backend_type || "claude",
         cliSocket: null,
+        codexAdapter: null,
         browserSockets: new Set(),
         state: p.state,
         pendingPermissions: new Map(p.pendingPermissions || []),
+        pendingControlRequests: new Map(),
         messageHistory: p.messageHistory || [],
         pendingMessages: p.pendingMessages || [],
+        nextEventSeq: p.nextEventSeq && p.nextEventSeq > 0 ? p.nextEventSeq : 1,
+        eventBuffer: Array.isArray(p.eventBuffer) ? p.eventBuffer : [],
+        lastAckSeq: typeof p.lastAckSeq === "number" ? p.lastAckSeq : 0,
+        processedClientMessageIds: Array.isArray(p.processedClientMessageIds) ? p.processedClientMessageIds : [],
+        processedClientMessageIdSet: new Set(
+          Array.isArray(p.processedClientMessageIds) ? p.processedClientMessageIds : [],
+        ),
       };
+      session.state.backend_type = session.backendType;
+      // Resolve git info for restored sessions (may have been persisted without it)
+      resolveSessionGitInfo(session.id, session.state);
       this.sessions.set(p.id, session);
       // Restored sessions with completed turns don't need auto-naming re-triggered
       if (session.state.num_turns > 0) {
@@ -140,24 +186,87 @@ export class WsBridge {
       messageHistory: session.messageHistory,
       pendingMessages: session.pendingMessages,
       pendingPermissions: Array.from(session.pendingPermissions.entries()),
+      eventBuffer: session.eventBuffer,
+      nextEventSeq: session.nextEventSeq,
+      lastAckSeq: session.lastAckSeq,
+      processedClientMessageIds: session.processedClientMessageIds,
     });
+  }
+
+  private refreshGitInfo(
+    session: Session,
+    options: { broadcastUpdate?: boolean; notifyPoller?: boolean } = {},
+  ): void {
+    const before = {
+      git_branch: session.state.git_branch,
+      is_worktree: session.state.is_worktree,
+      is_containerized: session.state.is_containerized,
+      repo_root: session.state.repo_root,
+      git_ahead: session.state.git_ahead,
+      git_behind: session.state.git_behind,
+    };
+
+    resolveSessionGitInfo(session.id, session.state);
+
+    let changed = false;
+    for (const key of WsBridge.GIT_SESSION_KEYS) {
+      if (session.state[key] !== before[key]) {
+        changed = true;
+        break;
+      }
+    }
+
+    if (changed) {
+      if (options.broadcastUpdate) {
+        this.broadcastToBrowsers(session, {
+          type: "session_update",
+          session: {
+            git_branch: session.state.git_branch,
+            is_worktree: session.state.is_worktree,
+            is_containerized: session.state.is_containerized,
+            repo_root: session.state.repo_root,
+            git_ahead: session.state.git_ahead,
+            git_behind: session.state.git_behind,
+          },
+        });
+      }
+      this.persistSession(session);
+    }
+
+    if (options.notifyPoller && session.state.git_branch && session.state.cwd && this.onGitInfoReady) {
+      this.onGitInfoReady(session.id, session.state.cwd, session.state.git_branch);
+    }
   }
 
   // ── Session management ──────────────────────────────────────────────────
 
-  getOrCreateSession(sessionId: string): Session {
+  getOrCreateSession(sessionId: string, backendType?: BackendType): Session {
     let session = this.sessions.get(sessionId);
     if (!session) {
+      const type = backendType || "claude";
       session = {
         id: sessionId,
+        backendType: type,
         cliSocket: null,
+        codexAdapter: null,
         browserSockets: new Set(),
-        state: makeDefaultState(sessionId),
+        state: makeDefaultState(sessionId, type),
         pendingPermissions: new Map(),
+        pendingControlRequests: new Map(),
         messageHistory: [],
         pendingMessages: [],
+        nextEventSeq: 1,
+        eventBuffer: [],
+        lastAckSeq: 0,
+        processedClientMessageIds: [],
+        processedClientMessageIdSet: new Set(),
       };
       this.sessions.set(sessionId, session);
+    } else if (backendType) {
+      // Only overwrite backendType when explicitly provided (e.g. attachCodexAdapter)
+      // Prevents handleBrowserOpen from resetting codex→claude
+      session.backendType = backendType;
+      session.state.backend_type = backendType;
     }
     return session;
   }
@@ -170,8 +279,18 @@ export class WsBridge {
     return Array.from(this.sessions.values()).map((s) => s.state);
   }
 
+  getCodexRateLimits(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    return session?.codexAdapter?.getRateLimits() ?? null;
+  }
+
   isCliConnected(sessionId: string): boolean {
-    return !!this.sessions.get(sessionId)?.cliSocket;
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (session.backendType === "codex") {
+      return !!session.codexAdapter?.isConnected();
+    }
+    return !!session.cliSocket;
   }
 
   removeSession(sessionId: string) {
@@ -187,10 +306,16 @@ export class WsBridge {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Close CLI socket
+    // Close CLI socket (Claude)
     if (session.cliSocket) {
       try { session.cliSocket.close(); } catch {}
       session.cliSocket = null;
+    }
+
+    // Disconnect Codex adapter
+    if (session.codexAdapter) {
+      session.codexAdapter.disconnect().catch(() => {});
+      session.codexAdapter = null;
     }
 
     // Close all browser sockets
@@ -204,6 +329,28 @@ export class WsBridge {
     this.store?.remove(sessionId);
   }
 
+  // ── Codex adapter attachment ────────────────────────────────────────────
+
+  /**
+   * Attach a CodexAdapter to a session. The adapter handles all message
+   * translation between the Codex app-server (stdio JSON-RPC) and the
+   * browser WebSocket protocol.
+   */
+  attachCodexAdapter(sessionId: string, adapter: CodexAdapter): void {
+    const session = this.getOrCreateSession(sessionId, "codex");
+    session.backendType = "codex";
+    session.state.backend_type = "codex";
+    session.codexAdapter = adapter;
+    attachCodexAdapterHandlers(sessionId, session, adapter, {
+      persistSession: this.persistSession.bind(this),
+      refreshGitInfo: this.refreshGitInfo.bind(this),
+      broadcastToBrowsers: this.broadcastToBrowsers.bind(this),
+      onCLISessionId: this.onCLISessionId,
+      onFirstTurnCompleted: this.onFirstTurnCompleted,
+      autoNamingAttempted: this.autoNamingAttempted,
+    });
+  }
+
   // ── CLI WebSocket handlers ──────────────────────────────────────────────
 
   handleCLIOpen(ws: ServerWebSocket<SocketData>, sessionId: string) {
@@ -212,13 +359,17 @@ export class WsBridge {
     console.log(`[ws-bridge] CLI connected for session ${sessionId}`);
     this.broadcastToBrowsers(session, { type: "cli_connected" });
 
-    // Flush any messages that were queued while waiting for CLI to connect
+    // Flush any messages queued while waiting for the CLI WebSocket.
+    // Per the SDK protocol, the first user message triggers system.init,
+    // so we must send it as soon as the WebSocket is open — NOT wait for
+    // system.init (which would create a deadlock for slow-starting sessions
+    // like Docker containers where the user message arrives before CLI connects).
     if (session.pendingMessages.length > 0) {
-      console.log(`[ws-bridge] Flushing ${session.pendingMessages.length} queued message(s) for session ${sessionId}`);
-      for (const ndjson of session.pendingMessages) {
+      console.log(`[ws-bridge] Flushing ${session.pendingMessages.length} queued message(s) on CLI connect for session ${sessionId}`);
+      const queued = session.pendingMessages.splice(0);
+      for (const ndjson of queued) {
         this.sendToCLI(session, ndjson);
       }
-      session.pendingMessages = [];
     }
   }
 
@@ -227,6 +378,9 @@ export class WsBridge {
     const sessionId = (ws.data as CLISocketData).sessionId;
     const session = this.sessions.get(sessionId);
     if (!session) return;
+
+    // Record raw incoming CLI message before any parsing
+    this.recorder?.record(sessionId, "in", data, "cli", session.backendType, session.state.cwd);
 
     // NDJSON: split on newlines, parse each line
     const lines = data.split("\n").filter((l) => l.trim());
@@ -262,8 +416,14 @@ export class WsBridge {
 
   handleBrowserOpen(ws: ServerWebSocket<SocketData>, sessionId: string) {
     const session = this.getOrCreateSession(sessionId);
+    const browserData = ws.data as BrowserSocketData;
+    browserData.subscribed = false;
+    browserData.lastAckSeq = 0;
     session.browserSockets.add(ws);
     console.log(`[ws-bridge] Browser connected for session ${sessionId} (${session.browserSockets.size} browsers)`);
+
+    // Refresh git state on browser connect so branch changes made mid-session are reflected.
+    this.refreshGitInfo(session, { notifyPoller: true });
 
     // Send current session state as snapshot
     const snapshot: BrowserIncomingMessage = {
@@ -285,11 +445,18 @@ export class WsBridge {
       this.sendToBrowser(ws, { type: "permission_request", request: perm });
     }
 
-    // Notify if CLI is not connected and request relaunch
-    if (!session.cliSocket) {
+    // Notify if backend is not connected and request relaunch
+    const backendConnected = session.backendType === "codex"
+      // Treat an attached adapter as "alive" during init.
+      // `isConnected()` flips true only after initialize/thread start, and
+      // relaunching during that window can kill a healthy startup.
+      ? !!session.codexAdapter
+      : !!session.cliSocket;
+
+    if (!backendConnected) {
       this.sendToBrowser(ws, { type: "cli_disconnected" });
       if (this.onCLIRelaunchNeeded) {
-        console.log(`[ws-bridge] Browser connected but CLI is dead for session ${sessionId}, requesting relaunch`);
+        console.log(`[ws-bridge] Browser connected but backend is dead for session ${sessionId}, requesting relaunch`);
         this.onCLIRelaunchNeeded(sessionId);
       }
     }
@@ -301,6 +468,9 @@ export class WsBridge {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    // Record raw incoming browser message
+    this.recorder?.record(sessionId, "in", data, "browser", session.backendType, session.state.cwd);
+
     let msg: BrowserOutgoingMessage;
     try {
       msg = JSON.parse(data);
@@ -309,7 +479,29 @@ export class WsBridge {
       return;
     }
 
-    this.routeBrowserMessage(session, msg);
+    this.routeBrowserMessage(session, msg, ws);
+  }
+
+  /** Send a user message into a session programmatically (no browser required).
+   *  Used by the cron scheduler and agent executor to send prompts to autonomous sessions. */
+  injectUserMessage(sessionId: string, content: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      console.error(`[ws-bridge] Cannot inject message: session ${sessionId} not found`);
+      return;
+    }
+    this.routeBrowserMessage(session, { type: "user_message", content });
+  }
+
+  /** Configure MCP servers on a session programmatically (no browser required).
+   *  Used by the agent executor to set up MCP servers after CLI connects. */
+  injectMcpSetServers(sessionId: string, servers: Record<string, McpServerConfig>): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      console.error(`[ws-bridge] Cannot inject MCP servers: session ${sessionId} not found`);
+      return;
+    }
+    this.routeBrowserMessage(session, { type: "mcp_set_servers", servers });
   }
 
   handleBrowserClose(ws: ServerWebSocket<SocketData>) {
@@ -357,6 +549,10 @@ export class WsBridge {
         this.handleAuthStatus(session, msg);
         break;
 
+      case "control_response":
+        handleControlResponse(session, msg, (message) => console.warn(message));
+        break;
+
       case "keep_alive":
         // Silently consume keepalives
         break;
@@ -367,7 +563,7 @@ export class WsBridge {
     }
   }
 
-  private handleSystemMessage(session: Session, msg: CLISystemInitMessage | CLISystemStatusMessage) {
+  private handleSystemMessage(session: Session, msg: CLISystemMessage) {
     if (msg.subtype === "init") {
       // Keep the launcher-assigned session_id as the canonical ID.
       // The CLI may report its own internal session_id which differs
@@ -379,7 +575,11 @@ export class WsBridge {
       }
 
       session.state.model = msg.model;
-      session.state.cwd = msg.cwd;
+      // For containerized sessions, the CLI reports /workspace as its cwd.
+      // Keep the host path (set by markContainerized()) for correct project grouping.
+      if (!session.state.is_containerized) {
+        session.state.cwd = msg.cwd;
+      }
       session.state.tools = msg.tools;
       session.state.permissionMode = msg.permissionMode;
       session.state.claude_code_version = msg.claude_code_version;
@@ -388,54 +588,28 @@ export class WsBridge {
       session.state.slash_commands = msg.slash_commands ?? [];
       session.state.skills = msg.skills ?? [];
 
-      // Resolve git info from session cwd
-      if (session.state.cwd) {
-        try {
-          session.state.git_branch = execSync("git rev-parse --abbrev-ref HEAD", {
-            cwd: session.state.cwd,
-            encoding: "utf-8",
-            timeout: 3000,
-          }).trim();
-
-          // Detect if in a worktree
-          try {
-            const gitDir = execSync("git rev-parse --git-dir", {
-              cwd: session.state.cwd, encoding: "utf-8", timeout: 3000,
-            }).trim();
-            session.state.is_worktree = gitDir.includes("/worktrees/");
-          } catch { /* ignore */ }
-
-          // Get repo root
-          try {
-            session.state.repo_root = execSync("git rev-parse --show-toplevel", {
-              cwd: session.state.cwd, encoding: "utf-8", timeout: 3000,
-            }).trim();
-          } catch { /* ignore */ }
-
-          // Ahead/behind remote
-          try {
-            const counts = execSync(
-              "git rev-list --left-right --count @{upstream}...HEAD",
-              { cwd: session.state.cwd, encoding: "utf-8", timeout: 3000 },
-            ).trim();
-            const [behind, ahead] = counts.split(/\s+/).map(Number);
-            session.state.git_ahead = ahead || 0;
-            session.state.git_behind = behind || 0;
-          } catch {
-            session.state.git_ahead = 0;
-            session.state.git_behind = 0;
-          }
-        } catch {
-          // Not a git repo or git not available
-        }
-      }
+      // Resolve and publish git info
+      this.refreshGitInfo(session, { notifyPoller: true });
 
       this.broadcastToBrowsers(session, {
         type: "session_init",
         session: session.state,
       });
       this.persistSession(session);
-    } else if (msg.subtype === "status") {
+
+      // Flush any messages queued before CLI was initialized (e.g. user sent
+      // a message while the container was still starting up).
+      if (session.pendingMessages.length > 0) {
+        console.log(`[ws-bridge] Flushing ${session.pendingMessages.length} queued message(s) after init for session ${session.id}`);
+        const queued = session.pendingMessages.splice(0);
+        for (const ndjson of queued) {
+          this.sendToCLI(session, ndjson);
+        }
+      }
+      return;
+    }
+
+    if (msg.subtype === "status") {
       session.state.is_compacting = msg.status === "compacting";
 
       if (msg.permissionMode) {
@@ -446,8 +620,108 @@ export class WsBridge {
         type: "status_change",
         status: msg.status ?? null,
       });
+      return;
     }
-    // Other system subtypes (compact_boundary, task_notification, etc.) can be forwarded as needed
+
+    if (msg.subtype === "compact_boundary") {
+      this.forwardSystemEvent(session, {
+        subtype: "compact_boundary",
+        compact_metadata: msg.compact_metadata,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "task_notification") {
+      this.forwardSystemEvent(session, {
+        subtype: "task_notification",
+        task_id: msg.task_id,
+        status: msg.status,
+        output_file: msg.output_file,
+        summary: msg.summary,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "files_persisted") {
+      this.forwardSystemEvent(session, {
+        subtype: "files_persisted",
+        files: msg.files,
+        failed: msg.failed,
+        processed_at: msg.processed_at,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "hook_started") {
+      this.forwardSystemEvent(session, {
+        subtype: "hook_started",
+        hook_id: msg.hook_id,
+        hook_name: msg.hook_name,
+        hook_event: msg.hook_event,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "hook_progress") {
+      this.forwardSystemEvent(session, {
+        subtype: "hook_progress",
+        hook_id: msg.hook_id,
+        hook_name: msg.hook_name,
+        hook_event: msg.hook_event,
+        stdout: msg.stdout,
+        stderr: msg.stderr,
+        output: msg.output,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      }, { persistInHistory: false });
+      return;
+    }
+
+    if (msg.subtype === "hook_response") {
+      this.forwardSystemEvent(session, {
+        subtype: "hook_response",
+        hook_id: msg.hook_id,
+        hook_name: msg.hook_name,
+        hook_event: msg.hook_event,
+        output: msg.output,
+        stdout: msg.stdout,
+        stderr: msg.stderr,
+        exit_code: msg.exit_code,
+        outcome: msg.outcome,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    // Unknown system subtypes are intentionally ignored until we map them.
+  }
+
+  private forwardSystemEvent(
+    session: Session,
+    event: Extract<BrowserIncomingMessage, { type: "system_event" }>["event"],
+    options: { persistInHistory?: boolean } = {},
+  ) {
+    const browserMsg: BrowserIncomingMessage = {
+      type: "system_event",
+      event,
+      timestamp: Date.now(),
+    };
+
+    if (options.persistInHistory !== false) {
+      session.messageHistory.push(browserMsg);
+      this.persistSession(session);
+    }
+
+    this.broadcastToBrowsers(session, browserMsg);
   }
 
   private handleAssistantMessage(session: Session, msg: CLIAssistantMessage) {
@@ -455,6 +729,7 @@ export class WsBridge {
       type: "assistant",
       message: msg.message,
       parent_tool_use_id: msg.parent_tool_use_id,
+      timestamp: Date.now(),
     };
     session.messageHistory.push(browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
@@ -478,12 +753,16 @@ export class WsBridge {
     if (msg.modelUsage) {
       for (const usage of Object.values(msg.modelUsage)) {
         if (usage.contextWindow > 0) {
-          session.state.context_used_percent = Math.round(
+          const pct = Math.round(
             ((usage.inputTokens + usage.outputTokens) / usage.contextWindow) * 100
           );
+          session.state.context_used_percent = Math.max(0, Math.min(pct, 100));
         }
       }
     }
+
+    // Re-check git state after each turn in case branch moved during the session.
+    this.refreshGitInfo(session, { broadcastUpdate: true, notifyPoller: true });
 
     const browserMsg: BrowserIncomingMessage = {
       type: "result",
@@ -569,26 +848,141 @@ export class WsBridge {
 
   // ── Browser message routing ─────────────────────────────────────────────
 
-  private routeBrowserMessage(session: Session, msg: BrowserOutgoingMessage) {
+  private routeBrowserMessage(
+    session: Session,
+    msg: BrowserOutgoingMessage,
+    ws?: ServerWebSocket<SocketData>,
+  ) {
+    if (msg.type === "session_subscribe") {
+      handleSessionSubscribe(
+        session,
+        ws,
+        msg.last_seq,
+        this.sendToBrowser.bind(this),
+        isHistoryBackedEvent,
+      );
+      return;
+    }
+
+    if (msg.type === "session_ack") {
+      handleSessionAck(session, ws, msg.last_seq, this.persistSession.bind(this));
+      return;
+    }
+
+    if (
+      WsBridge.IDEMPOTENT_BROWSER_MESSAGE_TYPES.has(msg.type)
+      && "client_msg_id" in msg
+      && msg.client_msg_id
+    ) {
+      if (isDuplicateClientMessage(session, msg.client_msg_id)) {
+        return;
+      }
+      rememberClientMessage(
+        session,
+        msg.client_msg_id,
+        WsBridge.PROCESSED_CLIENT_MSG_ID_LIMIT,
+        this.persistSession.bind(this),
+      );
+    }
+
+    // For Codex sessions, delegate entirely to the adapter
+    if (session.backendType === "codex") {
+      // Store user messages in history for replay with stable ID for dedup on reconnect
+      if (msg.type === "user_message") {
+        const ts = Date.now();
+        session.messageHistory.push({
+          type: "user_message",
+          content: msg.content,
+          timestamp: ts,
+          id: `user-${ts}-${this.userMsgCounter++}`,
+        });
+        this.persistSession(session);
+      }
+      if (msg.type === "permission_response") {
+        session.pendingPermissions.delete(msg.request_id);
+        this.persistSession(session);
+      }
+
+      if (session.codexAdapter) {
+        session.codexAdapter.sendBrowserMessage(msg);
+      } else {
+        // Adapter not yet attached — queue for when it's ready.
+        // The adapter itself also queues during init, but this covers
+        // the window between session creation and adapter attachment.
+        console.log(`[ws-bridge] Codex adapter not yet attached for session ${session.id}, queuing ${msg.type}`);
+        session.pendingMessages.push(JSON.stringify(msg));
+      }
+      return;
+    }
+
+    // Claude Code path (existing logic)
     switch (msg.type) {
       case "user_message":
         this.handleUserMessage(session, msg);
         break;
 
       case "permission_response":
-        this.handlePermissionResponse(session, msg);
+        handlePermissionResponse(session, msg, this.sendToCLI.bind(this));
         break;
 
       case "interrupt":
-        this.handleInterrupt(session);
+        handleInterrupt(session, this.sendToCLI.bind(this));
         break;
 
       case "set_model":
-        this.handleSetModel(session, msg.model);
+        handleSetModel(session, msg.model, this.sendToCLI.bind(this));
         break;
 
       case "set_permission_mode":
-        this.handleSetPermissionMode(session, msg.mode);
+        handleSetPermissionMode(session, msg.mode, this.sendToCLI.bind(this));
+        break;
+
+      case "mcp_get_status":
+        handleMcpGetStatus(
+          session,
+          (request, onResponse) => sendControlRequest(session, request, this.sendToCLI.bind(this), onResponse),
+          this.broadcastToBrowsers.bind(this),
+        );
+        break;
+
+      case "mcp_toggle":
+        handleMcpToggle(
+          (request) => sendControlRequest(session, request, this.sendToCLI.bind(this)),
+          msg.serverName,
+          msg.enabled,
+          () =>
+            handleMcpGetStatus(
+              session,
+              (request, onResponse) => sendControlRequest(session, request, this.sendToCLI.bind(this), onResponse),
+              this.broadcastToBrowsers.bind(this),
+            ),
+        );
+        break;
+
+      case "mcp_reconnect":
+        handleMcpReconnect(
+          (request) => sendControlRequest(session, request, this.sendToCLI.bind(this)),
+          msg.serverName,
+          () =>
+            handleMcpGetStatus(
+              session,
+              (request, onResponse) => sendControlRequest(session, request, this.sendToCLI.bind(this), onResponse),
+              this.broadcastToBrowsers.bind(this),
+            ),
+        );
+        break;
+
+      case "mcp_set_servers":
+        handleMcpSetServers(
+          (request) => sendControlRequest(session, request, this.sendToCLI.bind(this)),
+          msg.servers,
+          () =>
+            handleMcpGetStatus(
+              session,
+              (request, onResponse) => sendControlRequest(session, request, this.sendToCLI.bind(this), onResponse),
+              this.broadcastToBrowsers.bind(this),
+            ),
+        );
         break;
     }
   }
@@ -597,11 +991,13 @@ export class WsBridge {
     session: Session,
     msg: { type: "user_message"; content: string; session_id?: string; images?: { media_type: string; data: string }[] }
   ) {
-    // Store user message in history for replay (text-only for replay)
+    // Store user message in history for replay with stable ID for dedup on reconnect
+    const ts = Date.now();
     session.messageHistory.push({
       type: "user_message",
       content: msg.content,
-      timestamp: Date.now(),
+      timestamp: ts,
+      id: `user-${ts}-${this.userMsgCounter++}`,
     });
 
     // Build content: if images are present, use content block array; otherwise plain string
@@ -630,83 +1026,18 @@ export class WsBridge {
     this.persistSession(session);
   }
 
-  private handlePermissionResponse(
-    session: Session,
-    msg: { type: "permission_response"; request_id: string; behavior: "allow" | "deny"; updated_input?: Record<string, unknown>; updated_permissions?: unknown[]; message?: string }
-  ) {
-    // Remove from pending
-    const pending = session.pendingPermissions.get(msg.request_id);
-    session.pendingPermissions.delete(msg.request_id);
-
-    if (msg.behavior === "allow") {
-      const response: Record<string, unknown> = {
-        behavior: "allow",
-        updatedInput: msg.updated_input ?? pending?.input ?? {},
-      };
-      if (msg.updated_permissions?.length) {
-        response.updatedPermissions = msg.updated_permissions;
-      }
-      const ndjson = JSON.stringify({
-        type: "control_response",
-        response: {
-          subtype: "success",
-          request_id: msg.request_id,
-          response,
-        },
-      });
-      this.sendToCLI(session, ndjson);
-    } else {
-      const ndjson = JSON.stringify({
-        type: "control_response",
-        response: {
-          subtype: "success",
-          request_id: msg.request_id,
-          response: {
-            behavior: "deny",
-            message: msg.message || "Denied by user",
-          },
-        },
-      });
-      this.sendToCLI(session, ndjson);
-    }
-  }
-
-  private handleInterrupt(session: Session) {
-    const ndjson = JSON.stringify({
-      type: "control_request",
-      request_id: randomUUID(),
-      request: { subtype: "interrupt" },
-    });
-    this.sendToCLI(session, ndjson);
-  }
-
-  private handleSetModel(session: Session, model: string) {
-    const ndjson = JSON.stringify({
-      type: "control_request",
-      request_id: randomUUID(),
-      request: { subtype: "set_model", model },
-    });
-    this.sendToCLI(session, ndjson);
-  }
-
-  private handleSetPermissionMode(session: Session, mode: string) {
-    const ndjson = JSON.stringify({
-      type: "control_request",
-      request_id: randomUUID(),
-      request: { subtype: "set_permission_mode", mode },
-    });
-    this.sendToCLI(session, ndjson);
-  }
-
   // ── Transport helpers ───────────────────────────────────────────────────
 
   private sendToCLI(session: Session, ndjson: string) {
     if (!session.cliSocket) {
-      // Queue the message — CLI might still be starting up
+      // Queue the message — CLI might still be starting up.
+      // Don't record here; the message will be recorded when flushed.
       console.log(`[ws-bridge] CLI not yet connected for session ${session.id}, queuing message`);
       session.pendingMessages.push(ndjson);
       return;
     }
+    // Record raw outgoing CLI message (only when actually sending, not when queuing)
+    this.recorder?.record(session.id, "out", ndjson, "cli", session.backendType, session.state.cwd);
     try {
       // NDJSON requires a newline delimiter
       session.cliSocket.send(ndjson + "\n");
@@ -723,7 +1054,22 @@ export class WsBridge {
   }
 
   private broadcastToBrowsers(session: Session, msg: BrowserIncomingMessage) {
-    const json = JSON.stringify(msg);
+    // Debug: warn when assistant messages are broadcast to 0 browsers (they may be lost)
+    if (session.browserSockets.size === 0 && (msg.type === "assistant" || msg.type === "stream_event" || msg.type === "result")) {
+      console.log(`[ws-bridge] ⚠ Broadcasting ${msg.type} to 0 browsers for session ${session.id} (stored in history: ${msg.type === "assistant" || msg.type === "result"})`);
+    }
+    const json = JSON.stringify(
+      sequenceEvent(
+        session,
+        msg,
+        WsBridge.EVENT_BUFFER_LIMIT,
+        this.persistSession.bind(this),
+      ),
+    );
+
+    // Record raw outgoing browser message
+    this.recorder?.record(session.id, "out", json, "browser", session.backendType, session.state.cwd);
+
     for (const ws of session.browserSockets) {
       try {
         ws.send(json);
