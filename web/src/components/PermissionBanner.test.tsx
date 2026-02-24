@@ -94,8 +94,8 @@ describe("BashDisplay", () => {
 // ─── EditDisplay ─────────────────────────────────────────────────────────────
 
 describe("EditDisplay", () => {
-  it("renders old/new strings with added/removed labels", () => {
-    render(
+  it("renders diff view with old/new strings via DiffViewer", () => {
+    const { container } = render(
       <PermissionBanner
         permission={makePermission({
           tool_name: "Edit",
@@ -108,19 +108,19 @@ describe("EditDisplay", () => {
         sessionId="s1"
       />,
     );
-    expect(screen.getByText("/src/main.ts")).toBeTruthy();
-    expect(screen.getByText("removed")).toBeTruthy();
-    expect(screen.getByText("added")).toBeTruthy();
-    expect(screen.getByText("const a = 1;")).toBeTruthy();
-    expect(screen.getByText("const a = 2;")).toBeTruthy();
+    // DiffViewer renders file header (basename extracted)
+    expect(screen.getByText("main.ts")).toBeTruthy();
+    // DiffViewer renders del/add lines
+    expect(container.querySelector(".diff-line-del")).toBeTruthy();
+    expect(container.querySelector(".diff-line-add")).toBeTruthy();
   });
 });
 
 // ─── WriteDisplay ────────────────────────────────────────────────────────────
 
 describe("WriteDisplay", () => {
-  it("renders file path and content preview", () => {
-    render(
+  it("renders file path and content as new-file diff via DiffViewer", () => {
+    const { container } = render(
       <PermissionBanner
         permission={makePermission({
           tool_name: "Write",
@@ -132,13 +132,16 @@ describe("WriteDisplay", () => {
         sessionId="s1"
       />,
     );
-    expect(screen.getByText("/src/output.ts")).toBeTruthy();
-    expect(screen.getByText("export default 42;")).toBeTruthy();
+    // DiffViewer renders file header (basename extracted)
+    expect(screen.getByText("output.ts")).toBeTruthy();
+    // Write renders as all-add diff lines
+    expect(container.querySelector(".diff-line-add")).toBeTruthy();
+    expect(container.querySelector(".diff-line-del")).toBeNull();
   });
 
-  it("truncates content longer than 500 characters", () => {
+  it("renders long content as diff lines without manual truncation", () => {
     const longContent = "x".repeat(600);
-    render(
+    const { container } = render(
       <PermissionBanner
         permission={makePermission({
           tool_name: "Write",
@@ -150,9 +153,9 @@ describe("WriteDisplay", () => {
         sessionId="s1"
       />,
     );
-    // The displayed content should be truncated (500 chars + "...")
-    const pre = screen.getByText(/^x+\.\.\.$/);
-    expect(pre.textContent).toBe("x".repeat(500) + "...");
+    // DiffViewer renders the content as add lines
+    expect(container.querySelector(".diff-line-add")).toBeTruthy();
+    expect(screen.getByText("big.ts")).toBeTruthy();
   });
 });
 
@@ -417,6 +420,92 @@ describe("AskUserQuestionDisplay", () => {
 
     expect(screen.queryByText("Allow")).toBeNull();
     expect(screen.queryByText("Deny")).toBeNull();
+  });
+
+  it("removes Other send button and includes typed Other answer in submit", () => {
+    const perm = makePermission({
+      request_id: "req-ask-2",
+      tool_name: "AskUserQuestion",
+      input: {
+        questions: [
+          {
+            header: "Q1",
+            question: "Pick one",
+            options: [{ label: "A", description: "Option A" }],
+          },
+          {
+            header: "Q2",
+            question: "Add context",
+            options: [{ label: "B", description: "Option B" }],
+          },
+        ],
+      },
+    });
+    render(<PermissionBanner permission={perm} sessionId="s1" />);
+
+    const otherButtons = screen.getAllByText("Other...");
+    fireEvent.click(otherButtons[1]);
+    const input = screen.getByPlaceholderText("Type your answer...");
+    fireEvent.change(input, { target: { value: "Custom response" } });
+
+    expect(screen.queryByText("Send")).toBeNull();
+    fireEvent.click(screen.getByText("Submit answers"));
+
+    const payload = mockSendToSession.mock.calls[0][1];
+    expect(payload.updated_input.answers).toEqual({ "1": "Custom response" });
+  });
+
+  it("shows Enter hint for single-question custom Other input", () => {
+    const perm = makePermission({
+      tool_name: "AskUserQuestion",
+      input: {
+        questions: [
+          {
+            header: "Q",
+            question: "Choose",
+            options: [{ label: "X", description: "Option X" }],
+          },
+        ],
+      },
+    });
+    render(<PermissionBanner permission={perm} sessionId="s1" />);
+
+    fireEvent.click(screen.getByText("Other..."));
+    expect(screen.getByText("Press Enter to submit")).toBeTruthy();
+  });
+
+  it("clears custom Other answer when toggled off before submit", () => {
+    const perm = makePermission({
+      request_id: "req-ask-3",
+      tool_name: "AskUserQuestion",
+      input: {
+        questions: [
+          {
+            header: "Q1",
+            question: "Primary",
+            options: [{ label: "Keep", description: "Use default" }],
+          },
+          {
+            header: "Q2",
+            question: "Details",
+            options: [{ label: "Preset", description: "Use preset value" }],
+          },
+        ],
+      },
+    });
+    render(<PermissionBanner permission={perm} sessionId="s1" />);
+
+    const otherButtons = screen.getAllByText("Other...");
+    fireEvent.click(otherButtons[1]);
+    const input = screen.getByPlaceholderText("Type your answer...");
+    fireEvent.change(input, { target: { value: "Stale answer" } });
+    fireEvent.click(otherButtons[1]); // toggle off
+
+    fireEvent.click(screen.getByText("Keep"));
+    fireEvent.click(screen.getByText("Submit answers"));
+
+    const payload = mockSendToSession.mock.calls[0][1];
+    expect(payload.updated_input.answers).toEqual({ "0": "Keep" });
   });
 });
 
