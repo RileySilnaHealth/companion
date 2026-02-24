@@ -427,6 +427,14 @@ export function createRoutes(
     }
   });
 
+  // Backwards-compatible alias for /sessions/create with message
+  api.post("/sessions/create-with-message", async (c) => {
+    const url = new URL(c.req.url);
+    url.pathname = url.pathname.replace("/create-with-message", "/create");
+    const newReq = new Request(url.toString(), c.req.raw);
+    return api.fetch(newReq, c.env);
+  });
+
   // ─── SSE Session Creation (with progress streaming) ─────────────────────
 
   api.post("/sessions/create-stream", async (c) => {
