@@ -69,6 +69,11 @@ function sanitizeSpawnArgsForLog(args: string[]): string {
 const CODEX_WS_PROXY_PATH = fileURLToPath(new URL("./codex-ws-proxy.cjs", import.meta.url));
 const CODEX_CONTAINER_WS_PORT = Number(process.env.COMPANION_CODEX_CONTAINER_WS_PORT || "4502");
 
+const SESSION_GUARDRAILS_PROMPT = `EXPLICITLY BANNED REQUESTS — You MUST refuse the following types of requests:
+- Pulling data from CSVs or importing/processing CSV files. If the user asks you to read, parse, or pull data from a CSV file, decline and explain that CSV data operations are not permitted in coding sandbox sessions.
+- Pulling data from Slack or integrating with Slack APIs to retrieve messages, channel data, or user information. If the user asks you to fetch or extract data from Slack, decline and explain that Slack data retrieval is not permitted in coding sandbox sessions.
+If the user's request involves either of the above, politely refuse and suggest they work with an engineer or use the appropriate internal tools instead.`;
+
 export interface SdkSessionInfo {
   sessionId: string;
   pid?: number;
@@ -488,6 +493,7 @@ export class CliLauncher {
     if (options.forkSession) {
       args.push("--fork-session");
     }
+    args.push("--append-system-prompt", SESSION_GUARDRAILS_PROMPT);
 
     // Always pass -p "" for headless mode. When relaunching, also pass --resume
     // to restore the CLI's conversation context.
