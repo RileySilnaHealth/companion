@@ -1098,6 +1098,70 @@ describe("UsageLimitsSection (Claude Code sessions)", () => {
     const bar = container.querySelector("[style*='width: 100%']");
     expect(bar).toBeTruthy();
   });
+
+  it("renders context bar for Claude sessions when context_used_percent > 0", async () => {
+    // Context window percentage should display even when rate limits are empty
+    mockApi.getSessionUsageLimits.mockResolvedValueOnce({
+      five_hour: null,
+      seven_day: null,
+      extra_usage: null,
+    });
+    resetStore({
+      sessions: new Map([["s1", { backend_type: "claude", context_used_percent: 65 }]]),
+    });
+    render(<TaskPanel sessionId="s1" />);
+    const meter = await screen.findByRole("meter", { name: /context/i });
+    expect(meter).toBeInTheDocument();
+    expect(meter.getAttribute("aria-valuenow")).toBe("65");
+  });
+
+  it("renders context bar alongside rate limit bars", async () => {
+    // Both context % and 5h rate limit should appear together
+    mockApi.getSessionUsageLimits.mockResolvedValueOnce({
+      five_hour: { utilization: 30, resets_at: null },
+      seven_day: null,
+      extra_usage: null,
+    });
+    resetStore({
+      sessions: new Map([["s1", { backend_type: "claude", context_used_percent: 42 }]]),
+    });
+    render(<TaskPanel sessionId="s1" />);
+    expect(await screen.findByText("5h Limit")).toBeInTheDocument();
+    expect(screen.getByRole("meter", { name: /context/i })).toBeInTheDocument();
+  });
+
+  it("hides context bar when context_used_percent is 0", async () => {
+    // Context bar should not appear until first result message updates the percentage
+    mockApi.getSessionUsageLimits.mockResolvedValueOnce({
+      five_hour: { utilization: 20, resets_at: null },
+      seven_day: null,
+      extra_usage: null,
+    });
+    resetStore({
+      sessions: new Map([["s1", { backend_type: "claude", context_used_percent: 0 }]]),
+    });
+    render(<TaskPanel sessionId="s1" />);
+    await screen.findByText("5h Limit");
+    expect(screen.queryByRole("meter", { name: /context/i })).not.toBeInTheDocument();
+  });
+
+  it("renders nothing when API returns all null limits and context is 0", async () => {
+    // With no rate limits and no context usage, the section should be empty
+    mockApi.getSessionUsageLimits.mockResolvedValueOnce({
+      five_hour: null,
+      seven_day: null,
+      extra_usage: null,
+    });
+    resetStore({
+      sessions: new Map([["s1", { backend_type: "claude", context_used_percent: 0 }]]),
+    });
+    render(<TaskPanel sessionId="s1" />);
+    await vi.waitFor(() => {
+      expect(mockApi.getSessionUsageLimits).toHaveBeenCalled();
+    });
+    expect(screen.queryByRole("meter", { name: /context/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("5h Limit")).not.toBeInTheDocument();
+  });
 });
 
 describe("LinearIssueSection", () => {
