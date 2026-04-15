@@ -811,19 +811,24 @@ function handleParsedMessage(
       // Compute context % from the last iteration's usage + contextWindow from modelUsage.
       // Top-level usage sums across all iterations, which inflates the count for
       // multi-tool-call turns. The last iteration reflects actual context state.
+      // Skip updates from subagent results (lower num_turns than main conversation).
       if (r.usage && r.modelUsage) {
-        const contextWindow = Math.max(
-          ...Object.values(r.modelUsage).map((m) => m.contextWindow ?? 0)
-        );
-        if (contextWindow > 0) {
-          const lastIter = r.usage.iterations?.at(-1) ?? r.usage;
-          const totalTokens =
-            (lastIter.input_tokens ?? 0) +
-            (lastIter.output_tokens ?? 0) +
-            (lastIter.cache_read_input_tokens ?? 0) +
-            (lastIter.cache_creation_input_tokens ?? 0);
-          const pct = Math.round((totalTokens / contextWindow) * 100);
-          sessionUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
+        const currentNumTurns = store.sessions.get(sessionId)?.num_turns ?? 0;
+        const isMainConversation = r.num_turns >= currentNumTurns;
+        if (isMainConversation) {
+          const contextWindow = Math.max(
+            ...Object.values(r.modelUsage).map((m) => m.contextWindow ?? 0)
+          );
+          if (contextWindow > 0) {
+            const lastIter = r.usage.iterations?.at(-1) ?? r.usage;
+            const totalTokens =
+              (lastIter.input_tokens ?? 0) +
+              (lastIter.output_tokens ?? 0) +
+              (lastIter.cache_read_input_tokens ?? 0) +
+              (lastIter.cache_creation_input_tokens ?? 0);
+            const pct = Math.round((totalTokens / contextWindow) * 100);
+            sessionUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
+          }
         }
       }
       store.updateSession(sessionId, sessionUpdates);
