@@ -808,15 +808,19 @@ function handleParsedMessage(
       if (typeof r.total_lines_removed === "number") {
         sessionUpdates.total_lines_removed = r.total_lines_removed;
       }
-      // Compute context % from modelUsage if available
-      if (r.modelUsage) {
-        for (const usage of Object.values(r.modelUsage)) {
-          if (usage.contextWindow > 0) {
-            const pct = Math.round(
-              ((usage.inputTokens + usage.outputTokens) / usage.contextWindow) * 100
-            );
-            sessionUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
-          }
+      // Compute context % from per-turn usage + contextWindow from modelUsage
+      if (r.usage && r.modelUsage) {
+        const contextWindow = Math.max(
+          ...Object.values(r.modelUsage).map((m) => m.contextWindow ?? 0)
+        );
+        if (contextWindow > 0) {
+          const totalTokens =
+            (r.usage.input_tokens ?? 0) +
+            (r.usage.output_tokens ?? 0) +
+            (r.usage.cache_read_input_tokens ?? 0) +
+            (r.usage.cache_creation_input_tokens ?? 0);
+          const pct = Math.round((totalTokens / contextWindow) * 100);
+          sessionUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
         }
       }
       store.updateSession(sessionId, sessionUpdates);
@@ -1132,13 +1136,19 @@ function handleParsedMessage(
           if (typeof r.total_lines_removed === "number") {
             resultUpdates.total_lines_removed = r.total_lines_removed;
           }
-          if (r.modelUsage) {
-            for (const usage of Object.values(r.modelUsage)) {
-              if ((usage as { contextWindow: number; inputTokens: number; outputTokens: number }).contextWindow > 0) {
-                const u = usage as { contextWindow: number; inputTokens: number; outputTokens: number };
-                const pct = Math.round(((u.inputTokens + u.outputTokens) / u.contextWindow) * 100);
-                resultUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
-              }
+          if (r.usage && r.modelUsage) {
+            const contextWindow = Math.max(
+              ...Object.values(r.modelUsage).map((m: Record<string, unknown>) => (m.contextWindow as number) ?? 0)
+            );
+            if (contextWindow > 0) {
+              const u = r.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+              const totalTokens =
+                (u.input_tokens ?? 0) +
+                (u.output_tokens ?? 0) +
+                (u.cache_read_input_tokens ?? 0) +
+                (u.cache_creation_input_tokens ?? 0);
+              const pct = Math.round((totalTokens / contextWindow) * 100);
+              resultUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
             }
           }
           store.updateSession(sessionId, resultUpdates);
