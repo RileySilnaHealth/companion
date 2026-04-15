@@ -808,17 +808,20 @@ function handleParsedMessage(
       if (typeof r.total_lines_removed === "number") {
         sessionUpdates.total_lines_removed = r.total_lines_removed;
       }
-      // Compute context % from per-turn usage + contextWindow from modelUsage
+      // Compute context % from the last iteration's usage + contextWindow from modelUsage.
+      // Top-level usage sums across all iterations, which inflates the count for
+      // multi-tool-call turns. The last iteration reflects actual context state.
       if (r.usage && r.modelUsage) {
         const contextWindow = Math.max(
           ...Object.values(r.modelUsage).map((m) => m.contextWindow ?? 0)
         );
         if (contextWindow > 0) {
+          const lastIter = r.usage.iterations?.at(-1) ?? r.usage;
           const totalTokens =
-            (r.usage.input_tokens ?? 0) +
-            (r.usage.output_tokens ?? 0) +
-            (r.usage.cache_read_input_tokens ?? 0) +
-            (r.usage.cache_creation_input_tokens ?? 0);
+            (lastIter.input_tokens ?? 0) +
+            (lastIter.output_tokens ?? 0) +
+            (lastIter.cache_read_input_tokens ?? 0) +
+            (lastIter.cache_creation_input_tokens ?? 0);
           const pct = Math.round((totalTokens / contextWindow) * 100);
           sessionUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
         }
@@ -1141,12 +1144,13 @@ function handleParsedMessage(
               ...Object.values(r.modelUsage).map((m: Record<string, unknown>) => (m.contextWindow as number) ?? 0)
             );
             if (contextWindow > 0) {
-              const u = r.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+              const usageTyped = r.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; iterations?: Array<{ input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }> };
+              const lastIter = usageTyped.iterations?.at(-1) ?? usageTyped;
               const totalTokens =
-                (u.input_tokens ?? 0) +
-                (u.output_tokens ?? 0) +
-                (u.cache_read_input_tokens ?? 0) +
-                (u.cache_creation_input_tokens ?? 0);
+                (lastIter.input_tokens ?? 0) +
+                (lastIter.output_tokens ?? 0) +
+                (lastIter.cache_read_input_tokens ?? 0) +
+                (lastIter.cache_creation_input_tokens ?? 0);
               const pct = Math.round((totalTokens / contextWindow) * 100);
               resultUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
             }
