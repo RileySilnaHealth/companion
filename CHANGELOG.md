@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.97.0](https://github.com/RileySilnaHealth/companion/compare/the-companion-v0.96.0...the-companion-v0.97.0) (2026-04-20)
+
+
+### Features
+
+* **ui:** add context window usage bar to TopBar ([#9](https://github.com/RileySilnaHealth/companion/issues/9)) ([1ffdba9](https://github.com/RileySilnaHealth/companion/commit/1ffdba92cb0e23896a71d5ce95c541ad25fc4875))
+
+
+### Bug Fixes
+
+* **ui:** prevent unnecessary re-renders that break text selection ([#11](https://github.com/RileySilnaHealth/companion/issues/11)) ([9314fe5](https://github.com/RileySilnaHealth/companion/commit/9314fe5cab79fbc333382b79c10876666b038d60))
+
 ## [0.96.0](https://github.com/RileySilnaHealth/companion/compare/the-companion-v0.95.0...the-companion-v0.96.0) (2026-04-15)
 
 
