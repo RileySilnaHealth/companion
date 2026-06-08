@@ -108,6 +108,26 @@ function createMockCodexProc(pid = 12345) {
   };
 }
 
+// Claude stdio transport needs real stdio pipes on the spawned proc: stdin is
+// wrapped into a writer and stdout is read as the NDJSON event stream. The
+// stdout stream is left open (start(){}) so the adapter's reader stays pending
+// instead of hitting EOF and firing an immediate disconnect.
+function createMockClaudeStdioProc(pid = 12345) {
+  let resolve: (code: number) => void;
+  const exitedPromise = new Promise<number>((r) => {
+    resolve = r;
+  });
+  exitResolve = resolve!;
+  return {
+    pid,
+    kill: vi.fn(),
+    exited: exitedPromise,
+    stdin: new WritableStream<Uint8Array>(),
+    stdout: new ReadableStream<Uint8Array>({ start() {} }),
+    stderr: new ReadableStream<Uint8Array>({ start() {} }),
+  };
+}
+
 function createPendingCodexWsProxyProc(pid = 12345) {
   let resolve: (code: number) => void;
   const exitedPromise = new Promise<number>((r) => {
@@ -149,6 +169,11 @@ beforeEach(() => {
   delete process.env.COMPANION_FORCE_BYPASS_IN_CONTAINER;
   // Default to stdio for most tests; WS launcher behavior is covered explicitly below.
   process.env.COMPANION_CODEX_TRANSPORT = "stdio";
+  // Default Claude to the WebSocket (--sdk-url) transport so the existing
+  // host-launch assertions hold. The stdio transport (production default) is
+  // covered explicitly in the "claude stdio launcher" block, which sets
+  // COMPANION_CLAUDE_TRANSPORT=stdio and supplies a proc with stdio pipes.
+  process.env.COMPANION_CLAUDE_TRANSPORT = "ws";
   tempDir = mkdtempSync(join(tmpdir(), "launcher-test-"));
   store = new SessionStore(tempDir);
   launcher = new CliLauncher(3456);
@@ -161,6 +186,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.COMPANION_CODEX_TRANSPORT;
+  delete process.env.COMPANION_CLAUDE_TRANSPORT;
   delete process.env.COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS;
   delete process.env.COMPANION_CODEX_PONG_TIMEOUT_MS;
   rmSync(tempDir, { recursive: true, force: true });
@@ -510,6 +536,74 @@ describe("launch", () => {
     expect(mockSpawn).not.toHaveBeenCalled();
   });
 
+});
+
+// ─── claude stdio launcher ─────────────────────────────────────────────────────
+
+describe("claude stdio launcher", () => {
+  beforeEach(() => {
+    // Opt into the production-default stdio stream-json transport.
+    process.env.COMPANION_CLAUDE_TRANSPORT = "stdio";
+  });
+
+  it("omits --sdk-url and spawns with stdin/stdout/stderr pipes", () => {
+    // The stdio transport drives the CLI over stdin/stdout, so --sdk-url (which
+    // newer CLI versions reject for non-Anthropic hosts) must NOT be passed.
+    mockSpawn.mockReturnValueOnce(createMockClaudeStdioProc());
+
+    launcher.launch({ cwd: "/tmp/project" });
+
+    expect(mockSpawn).toHaveBeenCalledOnce();
+    const [cmdAndArgs, options] = mockSpawn.mock.calls[0];
+
+    expect(cmdAndArgs[0]).toBe("/usr/bin/claude");
+    expect(cmdAndArgs).not.toContain("--sdk-url");
+    // Protocol flags are still present.
+    expect(cmdAndArgs).toContain("--print");
+    expect(cmdAndArgs).toContain("--output-format");
+    expect(cmdAndArgs).toContain("stream-json");
+    expect(cmdAndArgs).toContain("--input-format");
+    expect(cmdAndArgs).toContain("--include-partial-messages");
+    expect(cmdAndArgs).toContain("--verbose");
+
+    // stdin must be piped (NDJSON is written to the CLI's stdin).
+    expect(options.stdin).toBe("pipe");
+    expect(options.stdout).toBe("pipe");
+    expect(options.stderr).toBe("pipe");
+  });
+
+  it("emits backend:claude-adapter-created and marks the session connected", () => {
+    // The adapter attachment IS the transport-open event for stdio — there is
+    // no WebSocket dial-back — so the launcher emits the adapter and flips the
+    // session to "connected" immediately (mirrors the Codex stdio path).
+    mockSpawn.mockReturnValueOnce(createMockClaudeStdioProc());
+
+    const onAdapter = vi.fn();
+    companionBus.on("backend:claude-adapter-created", ({ sessionId, adapter }) => onAdapter(sessionId, adapter));
+
+    const info = launcher.launch({ cwd: "/tmp/project" });
+
+    expect(onAdapter).toHaveBeenCalledTimes(1);
+    expect(onAdapter.mock.calls[0][0]).toBe("test-session-id");
+    // The emitted adapter reports itself as a stdio-transport Claude adapter.
+    expect(onAdapter.mock.calls[0][1].isStdioTransport()).toBe(true);
+    expect(info.state).toBe("connected");
+  });
+
+  it("still uses the --sdk-url WebSocket transport for containerized Claude sessions", () => {
+    // Containers can't drive the CLI over the host process's stdio, so they
+    // keep the WebSocket dial-back regardless of COMPANION_CLAUDE_TRANSPORT.
+    launcher.launch({
+      cwd: "/tmp/project",
+      containerId: "abc123def456",
+      containerName: "companion-test",
+    });
+
+    const [cmdAndArgs] = mockSpawn.mock.calls[0];
+    const bashCmd = cmdAndArgs[cmdAndArgs.length - 1];
+    expect(bashCmd).toContain("--sdk-url");
+    expect(bashCmd).toContain("ws://host.docker.internal:3456/ws/cli/test-session-id");
+  });
 });
 
 // ─── state management ────────────────────────────────────────────────────────

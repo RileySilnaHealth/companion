@@ -13,6 +13,7 @@ import type { SessionStore } from "./session-store.js";
 import type { BackendType } from "./session-types.js";
 import type { RecorderManager } from "./recorder.js";
 import { CodexAdapter } from "./codex-adapter.js";
+import { ClaudeAdapter } from "./claude-adapter.js";
 import { resolveBinary, getEnrichedPath } from "./path-resolver.js";
 import { containerManager } from "./container-manager.js";
 import { companionBus } from "./event-bus.js";
@@ -25,6 +26,17 @@ import {
 function isCodexWsTransportEnabled(): boolean {
   const val = (process.env.COMPANION_CODEX_TRANSPORT || "ws").toLowerCase();
   return val === "ws" || val === "websocket";
+}
+
+/**
+ * Whether stdio transport is enabled for host Claude Code sessions (default).
+ * Drives the CLI over its supported stdin/stdout stream-json transport instead
+ * of the `--sdk-url` WebSocket dial-back (which newer CLI versions lock to
+ * Anthropic backend hosts). Set COMPANION_CLAUDE_TRANSPORT=ws to opt back into
+ * the legacy WebSocket path (e.g. for debugging or CLI versions that allow it).
+ */
+function isClaudeStdioTransportEnabled(): boolean {
+  return (process.env.COMPANION_CLAUDE_TRANSPORT || "stdio").toLowerCase() === "stdio";
 }
 
 /** Find a free TCP port in the given range by attempting to listen on each. */
@@ -465,6 +477,12 @@ export class CliLauncher {
   private spawnCLI(sessionId: string, info: SdkSessionInfo, options: LaunchOptions & { resumeSessionId?: string }): void {
     const isContainerized = !!options.containerId;
 
+    // Host sessions default to stdio stream-json transport (no --sdk-url).
+    // Containerized sessions still use the WebSocket dial-back (the CLI inside
+    // the container connects back to the host server); stdio for containers is
+    // a follow-up (would require docker exec -i + adapter.attachStdio).
+    const useStdio = !isContainerized && isClaudeStdioTransportEnabled();
+
     // For containerized sessions, the CLI binary lives inside the container.
     // For host sessions, resolve the binary on the host.
     let binary = options.claudeBinary || "claude";
@@ -518,7 +536,6 @@ export class CliLauncher {
     }
 
     const args: string[] = [
-      "--sdk-url", sdkUrl,
       "--print",
       "--output-format", "stream-json",
       "--input-format", "stream-json",
@@ -526,6 +543,12 @@ export class CliLauncher {
       "--include-partial-messages",
       "--verbose",
     ];
+
+    // Only the WebSocket transport uses --sdk-url (the CLI dials back over WS).
+    // The stdio transport drives the CLI over stdin/stdout instead.
+    if (!useStdio) {
+      args.unshift("--sdk-url", sdkUrl);
+    }
 
     if (options.model) {
       args.push("--model", options.model);
@@ -608,6 +631,8 @@ export class CliLauncher {
     const proc = Bun.spawn(spawnCmd, {
       cwd: spawnCwd,
       env: spawnEnv,
+      // stdio transport writes user/control NDJSON to the CLI's stdin.
+      stdin: useStdio ? "pipe" : undefined,
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -615,8 +640,42 @@ export class CliLauncher {
     info.pid = proc.pid;
     this.processes.set(sessionId, proc);
 
-    // Stream stdout/stderr for debugging
-    this.pipeOutput(sessionId, proc);
+    if (useStdio) {
+      // stdout is the protocol channel (NDJSON event stream) — hand it to the
+      // adapter and only route stderr to debug logs.
+      const stderr = proc.stderr;
+      if (stderr && typeof stderr !== "number") {
+        this.pipeStream(sessionId, stderr, "stderr");
+      }
+
+      const stdin = proc.stdin;
+      const stdout = proc.stdout;
+      if (!stdin || !stdout || typeof stdin === "number" || typeof stdout === "number") {
+        console.error(`[cli-launcher] Claude stdio session ${sessionId} missing stdio pipes`);
+        info.state = "exited";
+        info.exitCode = 1;
+        try { proc.kill("SIGTERM"); } catch {}
+        this.processes.delete(sessionId);
+        this.persistState();
+        return;
+      }
+
+      const adapter = new ClaudeAdapter(sessionId, { recorder: this.recorder });
+      adapter.attachStdio(
+        stdin as WritableStream<Uint8Array> | { write(data: Uint8Array): number },
+        stdout as ReadableStream<Uint8Array>,
+      );
+
+      // Notify the WsBridge to attach this adapter (mirrors the Codex stdio path).
+      companionBus.emit("backend:claude-adapter-created", { sessionId, adapter });
+
+      // Mark connected immediately — no WebSocket handshake to wait for.
+      info.state = "connected";
+    } else {
+      // WebSocket transport: the CLI dials back to /ws/cli/. Stream stdout and
+      // stderr to debug logs (the protocol travels over the WebSocket).
+      this.pipeOutput(sessionId, proc);
+    }
 
     // Monitor process exit
     const spawnedAt = Date.now();
