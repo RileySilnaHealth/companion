@@ -1,0 +1,14 @@
+[agent]
+id = "example-agent"
+runtime = "fly.default"
+network = "tailscale.default"
+model_provider = "openrouter.default"
+lifecycle = "present"
+protect = true
+fly_app = "example-companion-agent"
+tailscale_hostname = "example-agent"
+
+[default_vault]
+enabled = true
+name = "Example Agent"
+mcp_role = "write"

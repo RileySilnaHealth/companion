@@ -1,20 +1,15 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import App from "./App.js";
-import { initAnalytics } from "./analytics.js";
-import { AppErrorBoundary } from "./components/AppErrorBoundary.js";
+import App from "./App.tsx";
 import "./index.css";
 
-initAnalytics();
+const container = document.getElementById("root");
+if (!container) {
+  throw new Error('Companion Console: #root element not found in document');
+}
 
-createRoot(document.getElementById("root")!).render(
+createRoot(container).render(
   <StrictMode>
-    <AppErrorBoundary>
-      <App />
-    </AppErrorBoundary>
-  </StrictMode>
+    <App />
+  </StrictMode>,
 );
-
-// Register Service Worker in production (no-op in dev).
-// Dynamic import ensures SW registration never blocks initial render.
-import("./sw-register.js").catch(() => {});

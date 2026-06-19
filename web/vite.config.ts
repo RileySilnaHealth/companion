@@ -1,39 +1,27 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { VitePWA } from "vite-plugin-pwa";
 
+// The console dev UI runs on :5173. The Go console (started with
+// `companion console --workspace examples/minimal --dev-ui http://127.0.0.1:5173`)
+// reverse-proxies `/` and `/assets` here, while this dev server proxies the API
+// (`/api`) and health (`/healthz`) back to the Go console on :8788. That keeps the
+// browser on a single origin and lets the dev-only token endpoint
+// (`GET /api/console/session`) resolve the session token.
 export default defineConfig({
-  plugins: [
-    react(),
-    tailwindcss(),
-    VitePWA({
-      // Use existing public/manifest.json — do not generate one
-      manifest: false,
-      srcDir: "src",
-      filename: "sw.ts",
-      registerType: "autoUpdate",
-      strategies: "injectManifest",
-      injectManifest: {
-        // Precache all build output: JS chunks (incl. lazy-loaded), CSS, HTML,
-        // icons, SVGs, and the two terminal Nerd Font woff2 files (~2.4MB total)
-        globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
-        // Main bundle exceeds default 2 MiB — raise to 5 MiB
-        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-      },
-      devOptions: { enabled: false },
-    }),
-  ],
+  plugins: [react(), tailwindcss()],
   server: {
-    host: "0.0.0.0",
-    port: 5174,
-    strictPort: false,
+    port: 5173,
+    strictPort: true,
     proxy: {
-      "/api": "http://localhost:3457",
-      "/ws": {
-        target: "ws://localhost:3457",
-        ws: true,
-      },
+      "/api": "http://127.0.0.1:8788",
+      "/healthz": "http://127.0.0.1:8788",
     },
+  },
+  build: {
+    outDir: "dist",
+    // Keep %%CONSOLE_TOKEN%% sentinels verbatim in the emitted index.html so the
+    // Go server can inject the per-process session token at serve time.
+    emptyOutDir: true,
   },
 });

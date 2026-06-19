@@ -1,52 +1,100 @@
-// Setup file for jsdom-based tests
-// Polyfills that must be available before any module import
+// Vitest setup for jsdom-based component tests.
+//
+// - Registers @testing-library/jest-dom matchers (toBeInTheDocument, etc.).
+// - Auto-cleans the React tree between tests.
+// - Provides a fetch mock helper so tests assert behavior at the network
+//   boundary and never hit a live server.
 
-// Register vitest-axe matchers (toHaveNoViolations) in jsdom environments.
-// The vitest-axe/extend-expect entry is an empty file in some builds, so we
-// manually import the matcher and extend expect ourselves.
-if (typeof window !== "undefined") {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const matchers = await import("vitest-axe/matchers") as any;
-  expect.extend({ toHaveNoViolations: matchers.toHaveNoViolations });
-}
+import "@testing-library/jest-dom/vitest";
+import { afterEach, beforeEach, vi } from "vitest";
+import { cleanup } from "@testing-library/react";
 
-if (typeof window !== "undefined") {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    value: (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addListener: () => {},
-      removeListener: () => {},
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      dispatchEvent: () => false,
-    }),
-  });
+afterEach(() => {
+  cleanup();
+});
 
-  // Node.js 22+ ships native localStorage that requires --localstorage-file.
-  // Vitest may provide an invalid path, leaving a broken global that shadows
-  // jsdom's working implementation. Polyfill when getItem is missing.
-  if (
-    typeof globalThis.localStorage === "undefined" ||
-    typeof globalThis.localStorage.getItem !== "function"
-  ) {
-    const store = new Map<string, string>();
-    const storage = {
-      getItem: (key: string) => store.get(key) ?? null,
-      setItem: (key: string, value: string) => { store.set(key, String(value)); },
-      removeItem: (key: string) => { store.delete(key); },
-      clear: () => { store.clear(); },
-      get length() { return store.size; },
-      key: (index: number) => [...store.keys()][index] ?? null,
-    };
-    Object.defineProperty(globalThis, "localStorage", {
-      value: storage,
+// jsdom does not implement matchMedia; several components read it (e.g. for
+// prefers-reduced-motion). Provide an inert, non-matching stub.
+beforeEach(() => {
+  if (typeof window !== "undefined" && !window.matchMedia) {
+    Object.defineProperty(window, "matchMedia", {
       writable: true,
       configurable: true,
+      value: (query: string): MediaQueryList =>
+        ({
+          matches: false,
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as unknown as MediaQueryList,
     });
   }
+});
+
+/**
+ * A single recorded fetch interaction: a matcher against the request and the
+ * Response (or factory) to return when it matches.
+ */
+export interface FetchRoute {
+  method?: string;
+  /** Substring or RegExp matched against the request URL. */
+  url: string | RegExp;
+  /** Status code for the synthesized JSON response. Defaults to 200. */
+  status?: number;
+  /** JSON body, or a function computing it from the parsed request. */
+  body?: unknown | ((req: { url: string; method: string; body: unknown }) => unknown);
 }
 
-export {};
+/**
+ * Installs a `globalThis.fetch` mock that resolves the first matching route.
+ * Returns the vi mock so tests can assert on calls. Unmatched requests reject
+ * with a descriptive error to surface missing stubs loudly.
+ *
+ * Tests own the network: every component test that performs I/O must stub it
+ * here rather than reaching a real console server or provider.
+ */
+export function mockFetch(routes: FetchRoute[]): ReturnType<typeof vi.fn> {
+  const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const method = (init?.method ?? "GET").toUpperCase();
+    const route = routes.find((r) => {
+      if (r.method && r.method.toUpperCase() !== method) return false;
+      return typeof r.url === "string" ? url.includes(r.url) : r.url.test(url);
+    });
+    if (!route) {
+      throw new Error(`mockFetch: no route for ${method} ${url}`);
+    }
+    let parsedBody: unknown;
+    if (typeof init?.body === "string") {
+      try {
+        parsedBody = JSON.parse(init.body);
+      } catch {
+        parsedBody = init.body;
+      }
+    }
+    const payload =
+      typeof route.body === "function"
+        ? (route.body as (req: { url: string; method: string; body: unknown }) => unknown)({
+            url,
+            method,
+            body: parsedBody,
+          })
+        : route.body;
+    const status = route.status ?? 200;
+    return new Response(payload === undefined ? null : JSON.stringify(payload), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  vi.stubGlobal("fetch", fn);
+  return fn;
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});

@@ -1,0 +1,537 @@
+@import "tailwindcss";
+
+/* Meslo LGS Nerd Font Mono — terminal font with powerline & devicon glyphs */
+@font-face {
+  font-family: "MesloLGS Nerd Font Mono";
+  src: url("/fonts/MesloLGSNerdFontMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "MesloLGS Nerd Font Mono";
+  src: url("/fonts/MesloLGSNerdFontMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  /* Light Mode (default) */
+  --color-cc-bg: #faf9f6;
+  --color-cc-fg: #141413;
+  --color-cc-card: #ffffff;
+  --color-cc-primary: #d97757;
+  --color-cc-primary-hover: #e08b6b;
+  --color-cc-user-bubble: #f0efe8;
+  --color-cc-border: rgba(31,30,29,0.12);
+  --color-cc-muted: #6f6e69;
+  --color-cc-sidebar: #f5f4ef;
+  --color-cc-input-bg: #ffffff;
+  --color-cc-code-bg: #f5f4ef;
+  --color-cc-code-fg: #2d2d2d;
+  --color-cc-hover: rgba(31,30,29,0.05);
+  --color-cc-active: rgba(31,30,29,0.09);
+  --color-cc-success: #2d7d46;
+  --color-cc-error: #c53030;
+  --color-cc-warning: #b7791f;
+  --color-cc-sidebar-footer: #edece5;
+  --color-cc-separator: rgba(31,30,29,0.10);
+  --color-cc-info: #2b6cb0;
+  --color-cc-merged: #805ad5;
+  --color-cc-codex: #10a37f;
+  --color-cc-codex-hover: #0d8c6d;
+  /* Darker button-grade variants — meet WCAG AA (4.5:1) with white text */
+  --color-cc-primary-btn: #ad5535;
+  --color-cc-primary-btn-hover: #b85c3a;
+  --color-cc-codex-btn: #0a7d5f;
+  --color-cc-codex-btn-hover: #0b8362;
+}
+
+@keyframes fadeSlideIn {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(-1px) scale(1.002);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes userSlideIn {
+  0% {
+    opacity: 0;
+    transform: translateX(8px) scale(0.97);
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(-1px) scale(1.002);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.85); }
+}
+
+@keyframes typing-breathe {
+  0%, 100% { opacity: 0.4; transform: scale(0.92); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes gentle-bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 3s linear infinite;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-fade-in {
+  animation: fadeIn 200ms ease-out;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes name-appear {
+  0% {
+    opacity: 0;
+    filter: blur(8px);
+    transform: translateY(-2px);
+  }
+  50% {
+    opacity: 0.8;
+    filter: blur(2px);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0);
+  }
+}
+
+.animate-name-appear {
+  animation: name-appear 0.5s ease-out;
+}
+
+@keyframes menu-appear {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes ring-pulse {
+  0% { box-shadow: 0 0 0 0 var(--color-cc-warning); }
+  70% { box-shadow: 0 0 0 4px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+/* Accordion reveal — CSS-only smooth expand/collapse using grid rows.
+   Apply .accordion-panel to the wrapper, toggle data-open="true" to expand.
+   The inner child (.accordion-inner) handles overflow clipping. */
+.accordion-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 200ms ease-out, opacity 150ms ease-out, visibility 0s 200ms;
+  opacity: 0;
+  visibility: hidden;
+}
+
+.accordion-panel[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  transition: grid-template-rows 200ms ease-out, opacity 150ms ease-out, visibility 0s;
+}
+
+.accordion-panel > .accordion-inner {
+  overflow: hidden;
+}
+
+/* Dark mode overrides */
+.dark {
+  --color-cc-bg: #262624;
+  --color-cc-fg: #faf9f5;
+  --color-cc-card: #141413;
+  --color-cc-primary: #d97757;
+  --color-cc-primary-hover: #e08b6b;
+  --color-cc-user-bubble: #30302e;
+  --color-cc-border: rgba(222,220,209,0.15);
+  --color-cc-muted: #c2c0b6;
+  --color-cc-sidebar: #1e1e1c;
+  --color-cc-input-bg: #141413;
+  --color-cc-code-bg: #141413;
+  --color-cc-code-fg: #d4d4d4;
+  --color-cc-hover: rgba(222,220,209,0.06);
+  --color-cc-active: rgba(222,220,209,0.10);
+  --color-cc-success: #48bb78;
+  --color-cc-error: #fc8181;
+  --color-cc-warning: #f6e05e;
+  --color-cc-sidebar-footer: #141413;
+  --color-cc-separator: rgba(222,220,209,0.08);
+  --color-cc-info: #63b3ed;
+  --color-cc-merged: #b794f4;
+  --color-cc-codex: #34d399;
+  --color-cc-codex-hover: #2fc48d;
+  --color-cc-primary-btn: #ad5535;
+  --color-cc-primary-btn-hover: #b85c3a;
+  --color-cc-codex-btn: #0a7d5f;
+  --color-cc-codex-btn-hover: #0b8362;
+}
+
+/* Scrollbar styling — desktop only.
+   On mobile/touch devices, custom ::-webkit-scrollbar overrides switch
+   from native overlay scrollbars to classic always-visible ones, which
+   causes a persistent horizontal scrollbar. */
+@media (pointer: fine) {
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-cc-muted);
+    border-radius: 3px;
+    opacity: 0.4;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    opacity: 0.6;
+  }
+}
+
+/* Typography families */
+.font-serif-assistant {
+  font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+}
+
+.font-sans-ui {
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.font-mono-code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ─── Chat-specific refinements ──────────────────────────────────────────── */
+
+/* Subtle inner glow for the composer card on desktop */
+.composer-card {
+  box-shadow: 0 10px 30px rgba(0,0,0,0.10), inset 0 1px 0 rgba(255,255,255,0.06);
+  transition: box-shadow 200ms ease, border-color 200ms ease;
+}
+.composer-card:focus-within {
+  box-shadow: 0 12px 36px rgba(0,0,0,0.14), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+/* Thinking block expand/collapse animation */
+.thinking-expand {
+  animation: thinkingReveal 250ms ease-out;
+}
+@keyframes thinkingReveal {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 500px; }
+}
+
+/* Tool block hover lift */
+.tool-card {
+  transition: transform 150ms ease, box-shadow 150ms ease;
+}
+.tool-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+}
+
+/* Avatar gradient ring */
+.avatar-ring {
+  background: conic-gradient(from 180deg, var(--color-cc-primary), #e8a87c, var(--color-cc-primary));
+  padding: 1.5px;
+}
+.avatar-ring > .avatar-inner {
+  background: var(--color-cc-bg);
+}
+
+/* User bubble subtle gradient */
+.user-bubble-gradient {
+  background: linear-gradient(135deg, var(--color-cc-user-bubble), color-mix(in srgb, var(--color-cc-user-bubble) 85%, var(--color-cc-primary) 15%));
+}
+
+/* Generation stats pulsing bar */
+.stats-glow {
+  position: relative;
+}
+.stats-glow::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--color-cc-primary);
+  opacity: 0.4;
+  animation: typing-breathe 1.5s ease-in-out infinite;
+}
+
+/* ─── Onboarding provider cards ─────────────────────────────────────────── */
+.provider-card--claude:hover,
+.provider-card--claude:focus-visible {
+  border-color: var(--color-cc-primary);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--color-cc-primary) 12%, transparent);
+}
+.provider-card--codex:hover,
+.provider-card--codex:focus-visible {
+  border-color: var(--color-cc-codex);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--color-cc-codex) 12%, transparent);
+}
+
+/* WCAG AA button backgrounds — darker shades for white text contrast */
+.btn-primary-aa {
+  background-color: var(--color-cc-primary-btn);
+}
+.btn-primary-aa:hover {
+  background-color: var(--color-cc-primary-btn-hover);
+}
+.btn-codex-aa {
+  background-color: var(--color-cc-codex-btn);
+}
+.btn-codex-aa:hover {
+  background-color: var(--color-cc-codex-btn-hover);
+}
+
+/* Global focus-visible ring — ensures keyboard users always see focus.
+   Wrapped in @layer base so Tailwind utilities (e.g. outline-none) can override it. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-cc-primary);
+    outline-offset: 2px;
+  }
+}
+
+/* Respect reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Lock html/body so iOS PWA doesn't rubber-band the whole page.
+   min-height on html compensates for the upward shift caused by
+   apple-mobile-web-app-status-bar-style: black-translucent — iOS moves
+   the document up behind the status bar, creating an equal gap at the
+   bottom where the html background shows through. Adding the status bar
+   height back fills that gap. */
+html {
+  min-height: calc(100% + env(safe-area-inset-top));
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+/* Eliminate 300ms tap delay on interactive elements */
+button,
+[role="button"],
+a,
+input,
+textarea,
+select {
+  touch-action: manipulation;
+}
+
+/* ─── Safe-area insets for iOS standalone PWA (requires viewport-fit=cover) ─ */
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+.pb-safe {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+}
+/* Like pb-safe but only adds the raw safe-area inset (no minimum).
+   Use on elements that sit directly above the keyboard (e.g. Composer)
+   so there's no gap when the iOS keyboard is open. */
+.pb-safe-only {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (min-width: 640px) {
+  .pb-safe {
+    padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* ─── DiffViewer ──────────────────────────────────────────────────────────── */
+.diff-viewer {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--color-cc-border);
+  background: var(--color-cc-code-bg);
+  color: var(--color-cc-code-fg);
+}
+.diff-compact {
+  /* No scroll — parent handles truncation with "show more" */
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.diff-compact .diff-file-header {
+  display: none;
+}
+.diff-compact .diff-hunk-header {
+  font-size: 10px;
+  opacity: 0.4;
+  padding: 1px 4px;
+  font-style: italic;
+}
+.diff-full {
+  overflow-y: auto;
+}
+.diff-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--color-cc-card);
+}
+.diff-file + .diff-file {
+  border-top: 1px solid var(--color-cc-border);
+}
+.diff-file-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: rgba(31,30,29,0.15);
+  font-size: 11px;
+  border-bottom: 1px solid var(--color-cc-border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.dark .diff-file-header {
+  background: rgba(222,220,209,0.06);
+}
+.diff-hunk-header {
+  padding: 4px 12px;
+  color: var(--color-cc-primary);
+  font-size: 11px;
+  background: rgba(217, 119, 87, 0.06);
+}
+.diff-line {
+  display: flex;
+  min-height: 20px;
+}
+.diff-gutter {
+  flex-shrink: 0;
+  width: 44px;
+  text-align: right;
+  padding: 0 6px;
+  color: var(--color-cc-muted);
+  opacity: 0.5;
+  user-select: none;
+  font-size: 11px;
+}
+.diff-marker {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  user-select: none;
+}
+.diff-content {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding-right: 12px;
+}
+.diff-line-add {
+  background: rgba(45, 125, 70, 0.1);
+}
+.diff-line-add .diff-marker {
+  color: var(--color-cc-success);
+}
+.diff-line-del {
+  background: rgba(197, 48, 48, 0.1);
+}
+.diff-line-del .diff-marker {
+  color: var(--color-cc-error);
+}
+.dark .diff-line-add {
+  background: rgba(72, 187, 120, 0.08);
+}
+.dark .diff-line-del {
+  background: rgba(252, 129, 129, 0.08);
+}
+.diff-word-add {
+  background: rgba(45, 125, 70, 0.25);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.diff-word-del {
+  background: rgba(197, 48, 48, 0.25);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.dark .diff-word-add {
+  background: rgba(72, 187, 120, 0.2);
+}
+.dark .diff-word-del {
+  background: rgba(252, 129, 129, 0.2);
+}
+
+/* ─── xterm.js gap fix ──────────────────────────────────────────────────── */
+/* xterm renders whole rows only; stretch the viewport to fill leftover pixels */
+.xterm .xterm-viewport {
+  height: 100% !important;
+}

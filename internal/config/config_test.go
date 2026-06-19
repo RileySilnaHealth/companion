@@ -1,0 +1,290 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestNormalizeSampleConfigShape(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Defaults: RawDefaults{
+			APIServer: RawAPIServer{Enabled: boolPtr(true), Host: strPtr("0.0.0.0"), Port: intPtr(8642)},
+			Model: RawModel{
+				Enabled:          boolPtr(true),
+				Provider:         strPtr("openrouter"),
+				Default:          strPtr("google/gemini-3.5-flash"),
+				BaseURL:          strPtr("https://openrouter.ai/api/v1"),
+				APIKeySecretName: strPtr("OPENROUTER_API_KEY"),
+				APIKeyEnv:        strPtr("OPENROUTER_API_KEY"),
+			},
+		},
+		OpenWebUI: RawOpenWebUI{Enabled: boolPtr(true), TailscaleAcceptDNS: boolPtr(true)},
+		Agents: []RawAgent{
+			{ID: strPtr("example-peer"), FlyApp: strPtr("example-peer-app"), TailscaleHostname: strPtr("example-peer")},
+			{ID: strPtr("example-lab"), FlyApp: strPtr("example-lab-app"), TailscaleHostname: strPtr("example-lab")},
+			{
+				ID:                strPtr("sample"),
+				FlyApp:            strPtr("example-companion-sample"),
+				TailscaleHostname: strPtr("sample"),
+				Identity:          RawIdentity{Path: strPtr("identities/sample/SOUL.md")},
+			},
+			{ID: strPtr("secondary"), FlyApp: strPtr("example-secondary-app"), TailscaleHostname: strPtr("example-secondary")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize sample config: %v", err)
+	}
+	if len(cfg.Agents) != 4 {
+		t.Fatalf("expected 4 agents, got %d", len(cfg.Agents))
+	}
+	sample := cfg.Agents[2]
+	if sample.ID != "sample" {
+		t.Fatalf("unexpected third agent: %s", sample.ID)
+	}
+	if !sample.APIServer.Enabled {
+		t.Fatalf("expected api server inherited from defaults")
+	}
+	if !sample.Identity.Enabled || sample.Identity.Path != "identities/sample/SOUL.md" {
+		t.Fatalf("expected sample identity config, got %#v", sample.Identity)
+	}
+	if !cfg.OpenWebUI.Enabled || !cfg.OpenWebUI.TailscaleAcceptDNS {
+		t.Fatalf("expected enabled open webui with tailscale dns")
+	}
+}
+
+func TestReadSyncCannotExposeWriteMCP(t *testing.T) {
+	raw := RawConfig{
+		Agents: []RawAgent{{
+			ID:                strPtr("agent-a"),
+			FlyApp:            strPtr("agent-a"),
+			TailscaleHostname: strPtr("agent-a"),
+			VaultConnections: []RawVaultConnection{{
+				Name:    strPtr("source"),
+				Mode:    strPtr("sync"),
+				Role:    strPtr("read"),
+				MCPRole: strPtr("write"),
+				Host:    strPtr("source"),
+			}},
+		}},
+	}
+	_, err := Normalize(raw)
+	if err == nil {
+		t.Fatalf("expected invalid read sync write MCP")
+	}
+}
+
+func TestOpenWebUIConnectionsSkipDisabledAgent(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Defaults: RawDefaults{
+			APIServer: RawAPIServer{Enabled: boolPtr(true), Port: intPtr(8642)},
+		},
+		OpenWebUI: RawOpenWebUI{Enabled: boolPtr(true)},
+		Agents: []RawAgent{
+			{ID: strPtr("agent-a"), FlyApp: strPtr("agent-a"), TailscaleHostname: strPtr("agent-a")},
+			{ID: strPtr("agent-b"), FlyApp: strPtr("agent-b"), TailscaleHostname: strPtr("agent-b"), APIServer: RawAPIServer{OpenWebUIEnabled: boolPtr(false)}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	connections := cfg.OpenWebUIConnections()
+	if len(connections) != 1 || connections[0].AgentID != "agent-a" {
+		t.Fatalf("unexpected connections: %#v", connections)
+	}
+}
+
+func TestIdentityDefaultsAndOverrides(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Defaults: RawDefaults{
+			Identity: RawIdentity{Path: strPtr("identities/default/SOUL.md")},
+		},
+		Agents: []RawAgent{
+			{ID: strPtr("agent-a"), FlyApp: strPtr("agent-a"), TailscaleHostname: strPtr("agent-a")},
+			{ID: strPtr("agent-b"), FlyApp: strPtr("agent-b"), TailscaleHostname: strPtr("agent-b"), Identity: RawIdentity{
+				Soul:      strPtr("You are Agent B."),
+				Overwrite: boolPtr(false),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !cfg.Agents[0].Identity.Enabled || cfg.Agents[0].Identity.Path != "identities/default/SOUL.md" {
+		t.Fatalf("expected inherited identity path, got %#v", cfg.Agents[0].Identity)
+	}
+	if cfg.Agents[1].Identity.Path != "identities/default/SOUL.md" || cfg.Agents[1].Identity.Soul != "You are Agent B." || cfg.Agents[1].Identity.Overwrite {
+		t.Fatalf("expected overridden inline identity, got %#v", cfg.Agents[1].Identity)
+	}
+}
+
+func TestIdentityRejectsAbsolutePath(t *testing.T) {
+	_, err := Normalize(RawConfig{
+		Agents: []RawAgent{{
+			ID:                strPtr("agent-a"),
+			FlyApp:            strPtr("agent-a"),
+			TailscaleHostname: strPtr("agent-a"),
+			Identity:          RawIdentity{Path: strPtr("/tmp/SOUL.md")},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected absolute identity path to be rejected")
+	}
+}
+
+func TestAgentCanDisableInheritedIdentity(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Defaults: RawDefaults{
+			Identity: RawIdentity{Path: strPtr("identities/default/SOUL.md")},
+		},
+		Agents: []RawAgent{{
+			ID:                strPtr("agent-a"),
+			FlyApp:            strPtr("agent-a"),
+			TailscaleHostname: strPtr("agent-a"),
+			Identity:          RawIdentity{Enabled: boolPtr(false)},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if cfg.Agents[0].Identity.Enabled {
+		t.Fatalf("expected agent identity to be disabled, got %#v", cfg.Agents[0].Identity)
+	}
+}
+
+func TestIdentityEnabledRequiresPathOrSoul(t *testing.T) {
+	_, err := Normalize(RawConfig{
+		Agents: []RawAgent{{
+			ID:                strPtr("agent-a"),
+			FlyApp:            strPtr("agent-a"),
+			TailscaleHostname: strPtr("agent-a"),
+			Identity:          RawIdentity{Enabled: boolPtr(true)},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected enabled identity without path or soul to be rejected")
+	}
+}
+
+func TestCompanionSoulDefaultsOverridesAndDisable(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Defaults: RawDefaults{
+			CompanionSoul: RawCompanionSoul{Path: strPtr("identities/companion-soul.md")},
+		},
+		Agents: []RawAgent{
+			{ID: strPtr("agent-a"), FlyApp: strPtr("agent-a"), TailscaleHostname: strPtr("agent-a")},
+			{ID: strPtr("agent-b"), FlyApp: strPtr("agent-b"), TailscaleHostname: strPtr("agent-b"), CompanionSoul: RawCompanionSoul{
+				Text: strPtr("Use Granite for durable memory."),
+			}},
+			{ID: strPtr("agent-c"), FlyApp: strPtr("agent-c"), TailscaleHostname: strPtr("agent-c"), CompanionSoul: RawCompanionSoul{
+				Enabled: boolPtr(false),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !cfg.Agents[0].CompanionSoul.Enabled || cfg.Agents[0].CompanionSoul.Path != "identities/companion-soul.md" {
+		t.Fatalf("expected inherited companion soul path, got %#v", cfg.Agents[0].CompanionSoul)
+	}
+	if !cfg.Agents[1].CompanionSoul.Enabled || cfg.Agents[1].CompanionSoul.Path != "identities/companion-soul.md" || cfg.Agents[1].CompanionSoul.Text != "Use Granite for durable memory." {
+		t.Fatalf("expected companion soul text override to keep inherited path, got %#v", cfg.Agents[1].CompanionSoul)
+	}
+	if cfg.Agents[2].CompanionSoul.Enabled {
+		t.Fatalf("expected agent companion soul to be disabled, got %#v", cfg.Agents[2].CompanionSoul)
+	}
+}
+
+func TestCompanionSoulRejectsAbsolutePath(t *testing.T) {
+	_, err := Normalize(RawConfig{
+		Agents: []RawAgent{{
+			ID:                strPtr("agent-a"),
+			FlyApp:            strPtr("agent-a"),
+			TailscaleHostname: strPtr("agent-a"),
+			CompanionSoul:     RawCompanionSoul{Path: strPtr("/tmp/companion-soul.md")},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected absolute companion_soul path to be rejected")
+	}
+}
+
+func TestCompanionSoulEnabledRequiresPathOrText(t *testing.T) {
+	_, err := Normalize(RawConfig{
+		Agents: []RawAgent{{
+			ID:                strPtr("agent-a"),
+			FlyApp:            strPtr("agent-a"),
+			TailscaleHostname: strPtr("agent-a"),
+			CompanionSoul:     RawCompanionSoul{Enabled: boolPtr(true)},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected enabled companion_soul without path or text to be rejected")
+	}
+}
+
+func TestDashboardDisabledWhenUnset(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Agents: []RawAgent{{ID: strPtr("sample"), FlyApp: strPtr("example-companion-sample"), TailscaleHostname: strPtr("sample")}},
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if cfg.Dashboard.Enabled {
+		t.Fatalf("dashboard should be disabled when no [dashboard] block is present")
+	}
+}
+
+func TestDashboardNormalizationDefaults(t *testing.T) {
+	cfg, err := Normalize(RawConfig{
+		Dashboard: RawDashboard{Enabled: boolPtr(true)},
+		Agents:    []RawAgent{{ID: strPtr("sample"), FlyApp: strPtr("example-companion-sample"), TailscaleHostname: strPtr("sample")}},
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	d := cfg.Dashboard
+	if !d.Enabled {
+		t.Fatalf("dashboard should be enabled")
+	}
+	checks := map[string]bool{
+		"id":                 d.ID == "dashboard",
+		"runtime":            d.Runtime == "fly.default",
+		"network":            d.Network == "tailscale.default",
+		"memory_smallest":    d.Memory == "256mb",
+		"cpus":               d.CPUs == 1,
+		"port":               d.Port == 9300,
+		"refresh_interval":   d.RefreshInterval == 30,
+		"fly_token_secret":   d.FlyTokenSecretName == "FLY_API_TOKEN",
+		"ts_api_key_secret":  d.TailscaleAPIKeySecretName == "TAILSCALE_API_KEY",
+		"ts_authkey_default": d.TailscaleAuthKeySecretName == "TS_AUTHKEY",
+	}
+	for name, ok := range checks {
+		if !ok {
+			t.Fatalf("dashboard default %s incorrect: %#v", name, d)
+		}
+	}
+}
+
+func TestDashboardValidationRejectsBadRefreshInterval(t *testing.T) {
+	_, err := Normalize(RawConfig{
+		Dashboard: RawDashboard{Enabled: boolPtr(true), RefreshInterval: intPtr(1)},
+		Agents:    []RawAgent{{ID: strPtr("sample"), FlyApp: strPtr("example-companion-sample"), TailscaleHostname: strPtr("sample")}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "refresh_interval") {
+		t.Fatalf("expected refresh_interval validation error, got %v", err)
+	}
+}
+
+func TestDashboardValidationRejectsBadFlyApp(t *testing.T) {
+	_, err := Normalize(RawConfig{
+		Dashboard: RawDashboard{Enabled: boolPtr(true), FlyApp: strPtr("Invalid_App")},
+		Agents:    []RawAgent{{ID: strPtr("sample"), FlyApp: strPtr("example-companion-sample"), TailscaleHostname: strPtr("sample")}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "dashboard.fly_app") {
+		t.Fatalf("expected dashboard.fly_app validation error, got %v", err)
+	}
+}
+
+func strPtr(value string) *string { return &value }
+func boolPtr(value bool) *bool    { return &value }
+func intPtr(value int) *int       { return &value }

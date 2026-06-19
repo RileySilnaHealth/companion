@@ -1,0 +1,12 @@
+workspace = "companion-webui"
+
+[backend.local]
+state = ".companion/state.sqlite"
+
+[load]
+providers = "providers.toml"
+defaults = "defaults.toml"
+webui = "webui.toml"
+dashboard = "dashboard.toml"
+agents = "agents/*.toml"
+vaults = "vaults/*.toml"
