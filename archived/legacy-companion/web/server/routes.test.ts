@@ -313,6 +313,7 @@ function createMockBridge() {
     prePopulateCommands: vi.fn(),
     broadcastNameUpdate: vi.fn(),
     injectSystemPrompt: vi.fn(),
+    injectUserMessage: vi.fn(),
   } as any;
 }
 
@@ -533,6 +534,47 @@ describe("POST /api/sessions/create", () => {
     // Route catches JSON parse errors and defaults to {}
     expect(res.status).toBe(200);
     expect(orchestrator.createSession).toHaveBeenCalledWith({});
+  });
+});
+
+describe("POST /api/sessions/create-with-message", () => {
+  it("creates a session and injects the initial message", async () => {
+    const res = await app.request("/api/sessions/create-with-message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test", message: "do the thing" }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({ sessionId: "session-1", messageQueued: true });
+    expect(bridge.injectUserMessage).toHaveBeenCalledWith("session-1", "do the thing");
+  });
+
+  it("creates a session without queuing when no message is provided", async () => {
+    const res = await app.request("/api/sessions/create-with-message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test" }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({ sessionId: "session-1", messageQueued: false });
+    expect(bridge.injectUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("returns the orchestrator error when session creation fails", async () => {
+    orchestrator.createSession.mockResolvedValue({ ok: false, error: "boom", status: 400 });
+
+    const res = await app.request("/api/sessions/create-with-message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test", message: "do the thing" }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(bridge.injectUserMessage).not.toHaveBeenCalled();
   });
 });
 
