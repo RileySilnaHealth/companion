@@ -5,9 +5,7 @@ import { execSync } from "node:child_process";
 import { resolveBinary } from "./path-resolver.js";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { COMPANION_HOME } from "./paths.js";
-import { existsSync, readFileSync } from "node:fs";
 import type { SessionOrchestrator } from "./session-orchestrator.js";
 import type { CliLauncher } from "./cli-launcher.js";
 import type { WsBridge } from "./ws-bridge.js";
@@ -35,6 +33,7 @@ import { registerLinearConnectionRoutes } from "./routes/linear-connection-route
 import { getConnection, resolveApiKey } from "./linear-connections.js";
 import { registerLinearOAuthConnectionRoutes } from "./routes/linear-oauth-connection-routes.js";
 import { getSettings } from "./settings-manager.js";
+import { lastUsedModel, listBackendModels } from "./backend-models.js";
 import { discoverClaudeSessions } from "./claude-session-discovery.js";
 import { getClaudeSessionHistoryPage } from "./claude-session-history.js";
 import { verifyToken, getToken, regenerateToken, getAllAddresses } from "./auth-manager.js";
@@ -1201,41 +1200,12 @@ export function createRoutes(
 
   api.get("/backends/:id/models", (c) => {
     const backendId = c.req.param("id");
-
-    if (backendId === "codex") {
-      // Read Codex model list from its local cache file
-      const cachePath = join(homedir(), ".codex", "models_cache.json");
-      if (!existsSync(cachePath)) {
-        return c.json({ error: "Codex models cache not found. Run codex once to populate it." }, 404);
-      }
-      try {
-        const raw = readFileSync(cachePath, "utf-8");
-        const cache = JSON.parse(raw) as {
-          models: Array<{
-            slug: string;
-            display_name?: string;
-            description?: string;
-            visibility?: string;
-            priority?: number;
-          }>;
-        };
-        // Only return visible models, sorted by priority
-        const models = cache.models
-          .filter((m) => m.visibility === "list")
-          .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
-          .map((m) => ({
-            value: m.slug,
-            label: m.display_name || m.slug,
-            description: m.description || "",
-          }));
-        return c.json(models);
-      } catch (e) {
-        return c.json({ error: "Failed to parse Codex models cache" }, 500);
-      }
+    if (backendId !== "claude" && backendId !== "codex") {
+      return c.json({ error: `Unknown backend "${backendId}"` }, 404);
     }
 
-    // Claude models are hardcoded on the frontend
-    return c.json({ error: "Use frontend defaults for this backend" }, 404);
+    const preferred = lastUsedModel(launcher.listSessions(), backendId);
+    return c.json(listBackendModels(backendId, preferred));
   });
 
   // ─── Containers ─────────────────────────────────────────────────
