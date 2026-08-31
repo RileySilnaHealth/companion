@@ -440,6 +440,149 @@ describe("Connection lifecycle", () => {
   });
 });
 
+// ─── Stdio transport ─────────────────────────────────────────────────────────
+
+/**
+ * Build a mock stdio pair for the stdin/stdout stream-json transport.
+ * - stdin: a `{ write }` object (the shape of Bun's subprocess stdin) whose
+ *   write spy captures the NDJSON bytes the adapter sends.
+ * - stdout: a ReadableStream we can push NDJSON chunks into and close, to
+ *   drive the adapter's read loop.
+ */
+function createStdioPair() {
+  const stdinWrite = vi.fn();
+  const stdin = { write: stdinWrite };
+  let controller: ReadableStreamDefaultController<Uint8Array>;
+  const stdout = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+  });
+  const enc = new TextEncoder();
+  return {
+    stdin,
+    stdinWrite,
+    stdout,
+    /** Push a raw chunk (may be a partial line) into stdout. */
+    pushChunk: (chunk: string) => controller!.enqueue(enc.encode(chunk)),
+    /** Push a complete NDJSON line (adds the newline delimiter). */
+    pushLine: (line: string) => controller!.enqueue(enc.encode(line + "\n")),
+    close: () => controller!.close(),
+  };
+}
+
+/** Decode all captured stdin writes back into a single string. */
+function decodeStdinWrites(stdinWrite: ReturnType<typeof vi.fn>): string {
+  const dec = new TextDecoder();
+  return stdinWrite.mock.calls.map((c) => dec.decode(c[0] as Uint8Array)).join("");
+}
+
+/** Let the WritableStream sink microtasks and the stdout read loop run. */
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+describe("Stdio transport", () => {
+  it("attachStdio marks the adapter connected and reports stdio transport", () => {
+    // Driving the CLI over stdio (no --sdk-url WebSocket) should make the
+    // adapter report itself connected and flag the transport as stdio so the
+    // bridge treats disconnect == process exit (like Codex).
+    const { stdin, stdout } = createStdioPair();
+    expect(adapter.isStdioTransport()).toBe(false);
+
+    adapter.attachStdio(stdin, stdout);
+
+    expect(adapter.isConnected()).toBe(true);
+    expect(adapter.isStdioTransport()).toBe(true);
+  });
+
+  it("send() after attachStdio writes translated NDJSON to stdin", async () => {
+    // A browser user_message must be translated to a Claude `user` NDJSON line
+    // and written to the child's stdin, newline-delimited.
+    const { stdin, stdinWrite, stdout } = createStdioPair();
+    adapter.attachStdio(stdin, stdout);
+
+    adapter.send({ type: "user_message", content: "Hello over stdio" });
+    await flush();
+
+    const written = decodeStdinWrites(stdinWrite);
+    expect(written.endsWith("\n")).toBe(true);
+    const parsed = JSON.parse(written.trim());
+    expect(parsed.type).toBe("user");
+    expect(parsed.message.role).toBe("user");
+    expect(parsed.message.content).toBe("Hello over stdio");
+  });
+
+  it("messages queued before attachStdio are flushed on attach", async () => {
+    // Messages sent before the transport is attached must be queued and then
+    // delivered (in order) once attachStdio wires up the stdin writer.
+    adapter.send({ type: "user_message", content: "first" });
+    adapter.send({ type: "user_message", content: "second" });
+
+    const { stdin, stdinWrite, stdout } = createStdioPair();
+    adapter.attachStdio(stdin, stdout);
+    await flush();
+
+    const lines = decodeStdinWrites(stdinWrite).trim().split("\n").filter(Boolean);
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0]).message.content).toBe("first");
+    expect(JSON.parse(lines[1]).message.content).toBe("second");
+  });
+
+  it("routes incoming NDJSON from stdout to the browser callback", async () => {
+    // A complete NDJSON line on stdout should be parsed and routed exactly like
+    // the WebSocket path (it reuses handleRawMessage).
+    const { stdin, stdout, pushLine } = createStdioPair();
+    adapter.attachStdio(stdin, stdout);
+
+    pushLine(makeAssistantMsg());
+    await flush();
+
+    expect(browserMessageCb).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "assistant" }),
+    );
+  });
+
+  it("buffers a JSON line split across two stdout chunks and parses it once", async () => {
+    // A single read() can split a JSON line mid-way. The adapter must buffer the
+    // partial line and only parse once the newline arrives — no parse-error
+    // protocol-drift, exactly one routed message.
+    const { stdin, stdout, pushChunk } = createStdioPair();
+    adapter.attachStdio(stdin, stdout);
+
+    const full = makeAssistantMsg();
+    const splitAt = Math.floor(full.length / 2);
+    pushChunk(full.slice(0, splitAt));
+    await flush();
+    // Nothing routed yet — the line is incomplete.
+    expect(browserMessageCb).not.toHaveBeenCalled();
+
+    pushChunk(full.slice(splitAt) + "\n");
+    await flush();
+
+    const assistantCalls = browserMessageCb.mock.calls.filter(
+      (c) => (c[0] as { type?: string }).type === "assistant",
+    );
+    expect(assistantCalls).toHaveLength(1);
+    // No error message was surfaced (the partial line did not trigger a parse error).
+    expect(browserMessageCb).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "error" }),
+    );
+  });
+
+  it("stdout close triggers disconnect and clears the connection", async () => {
+    // For a stdio session, stdout EOF == the CLI process exited, so the adapter
+    // must fire the disconnect callback and report itself disconnected.
+    const { stdin, stdout, close } = createStdioPair();
+    adapter.attachStdio(stdin, stdout);
+    expect(adapter.isConnected()).toBe(true);
+
+    close();
+    await flush();
+
+    expect(disconnectCb).toHaveBeenCalledOnce();
+    expect(adapter.isConnected()).toBe(false);
+  });
+});
+
 // ─── Message queuing ────────────────────────────────────────────────────────
 
 describe("Message queuing", () => {

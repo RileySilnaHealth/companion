@@ -256,6 +256,7 @@ describe("SessionOrchestrator", () => {
 
       expect(companionBus.listenerCount("session:cli-id-received")).toBeGreaterThan(0);
       expect(companionBus.listenerCount("backend:codex-adapter-created")).toBeGreaterThan(0);
+      expect(companionBus.listenerCount("backend:claude-adapter-created")).toBeGreaterThan(0);
       expect(companionBus.listenerCount("session:exited")).toBeGreaterThan(0);
       expect(companionBus.listenerCount("session:git-info-ready")).toBeGreaterThan(0);
       expect(companionBus.listenerCount("session:relaunch-needed")).toBeGreaterThan(0);
@@ -270,6 +271,18 @@ describe("SessionOrchestrator", () => {
       companionBus.emit("session:cli-id-received", { sessionId: "s1", cliSessionId: "cli-id-123" });
 
       expect(deps.launcher.setCLISessionId).toHaveBeenCalledWith("s1", "cli-id-123");
+    });
+
+    it("claude-adapter-created callback attaches the adapter to the bridge as a claude backend", () => {
+      // The stdio Claude transport emits backend:claude-adapter-created (no
+      // --sdk-url WebSocket dial-back). The orchestrator must forward it to the
+      // bridge tagged as the "claude" backend, mirroring the Codex stdio path.
+      orchestrator.initialize();
+
+      const adapter = { isStdioTransport: () => true } as any;
+      companionBus.emit("backend:claude-adapter-created", { sessionId: "s-stdio", adapter });
+
+      expect(deps.wsBridge.attachBackendAdapter).toHaveBeenCalledWith("s-stdio", adapter, "claude");
     });
 
     it("session exit callback notifies agentExecutor", () => {
@@ -389,6 +402,7 @@ describe("SessionOrchestrator", () => {
       const countsAfterFirst = {
         cliId: companionBus.listenerCount("session:cli-id-received"),
         codex: companionBus.listenerCount("backend:codex-adapter-created"),
+        claude: companionBus.listenerCount("backend:claude-adapter-created"),
         exited: companionBus.listenerCount("session:exited"),
         relaunch: companionBus.listenerCount("session:relaunch-needed"),
         idleKill: companionBus.listenerCount("session:idle-kill"),
@@ -400,6 +414,7 @@ describe("SessionOrchestrator", () => {
       // Listener counts should not have doubled after the second initialize()
       expect(companionBus.listenerCount("session:cli-id-received")).toBe(countsAfterFirst.cliId);
       expect(companionBus.listenerCount("backend:codex-adapter-created")).toBe(countsAfterFirst.codex);
+      expect(companionBus.listenerCount("backend:claude-adapter-created")).toBe(countsAfterFirst.claude);
       expect(companionBus.listenerCount("session:exited")).toBe(countsAfterFirst.exited);
       expect(companionBus.listenerCount("session:relaunch-needed")).toBe(countsAfterFirst.relaunch);
       expect(companionBus.listenerCount("session:idle-kill")).toBe(countsAfterFirst.idleKill);
