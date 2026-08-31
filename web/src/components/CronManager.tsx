@@ -288,7 +288,7 @@ export function CronManager({ onClose, embedded = false }: Props) {
               className="mb-6 rounded-xl bg-cc-card p-4 sm:p-5 space-y-3"
               style={{ animation: "fadeSlideIn 150ms ease-out" }}
             >
-              <JobForm form={formData} onChange={setFormData} />
+              <JobForm form={formData} onChange={setFormData} isNew />
               <p className="text-[10px] text-cc-muted">
                 Scheduled tasks run with full autonomy (bypassPermissions)
               </p>
@@ -488,7 +488,7 @@ export function CronManager({ onClose, embedded = false }: Props) {
       </button>
       {showCreate && (
         <div className="px-3 py-3 space-y-2.5">
-          <JobForm form={formData} onChange={setFormData} />
+          <JobForm form={formData} onChange={setFormData} isNew />
           <div className="text-[10px] text-cc-muted">
             Scheduled tasks run with full autonomy (bypassPermissions)
           </div>
@@ -685,9 +685,12 @@ function CronJobRow({ job, isRunning, onStartEdit, onDelete, onToggle, onRunNow 
 function JobForm({
   form,
   onChange,
+  isNew = false,
 }: {
   form: JobFormData;
   onChange: (form: JobFormData) => void;
+  /** A new job opens on the server's default model; an existing one keeps the model it was saved with. */
+  isNew?: boolean;
 }) {
   const update = (partial: Partial<JobFormData>) =>
     onChange({ ...form, ...partial });
@@ -706,12 +709,11 @@ function JobForm({
   // Fetch dynamic models when backend changes
   useEffect(() => {
     setDynamicModels(null);
-    if (form.backendType !== "codex") return;
     api.getBackendModels(form.backendType).then((fetched) => {
       if (fetched.length > 0) {
         const options = toModelOptions(fetched);
         setDynamicModels(options);
-        if (!options.some((m) => m.value === form.model)) {
+        if (isNew || !options.some((m) => m.value === form.model)) {
           update({ model: options[0].value });
         }
       }

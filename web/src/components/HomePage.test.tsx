@@ -151,6 +151,8 @@ describe("HomePage", () => {
     mockApi.listSandboxes.mockResolvedValue([]);
     mockApi.getImageStatus.mockResolvedValue({ status: "idle" });
     mockApi.pullImage.mockResolvedValue({ ok: true });
+    // Models are now fetched for every backend, not just codex.
+    mockApi.getBackendModels.mockResolvedValue([]);
   });
 
   it("auto-sets branch from selected mapped Linear issue", async () => {
@@ -960,6 +962,35 @@ describe("HomePage", () => {
     // The dynamically fetched model should appear
     await waitFor(() => {
       expect(screen.getByText("GPT Custom")).toBeInTheDocument();
+    });
+  });
+
+  // The server lists the model this machine last ran on that backend first, which is how
+  // a chat started here inherits the model the session was launched with. Claude used to
+  // skip the fetch entirely and always open on the first hardcoded entry.
+  it("opens a claude chat on the first model the server returns", async () => {
+    mockApi.getBackendModels.mockResolvedValue([
+      { value: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+      { value: "claude-opus-4-6", label: "Opus 4.6" },
+    ]);
+
+    render(<HomePage />);
+    await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
+
+    expect(mockApi.getBackendModels).toHaveBeenCalledWith("claude");
+    await waitFor(() => {
+      expect(screen.getByText("Sonnet 4.6")).toBeInTheDocument();
+    });
+  });
+
+  it("falls back to the hardcoded models when the fetch fails", async () => {
+    mockApi.getBackendModels.mockRejectedValue(new Error("offline"));
+
+    render(<HomePage />);
+    await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
+
+    await waitFor(() => {
+      expect(screen.getByText("Opus 4.6")).toBeInTheDocument();
     });
   });
 

@@ -3587,29 +3587,53 @@ describe("GET /api/backends/:id/models", () => {
     ]);
   });
 
-  it("returns 404 when codex cache file does not exist", async () => {
+  // No cache yet is the normal state of a fresh machine, so the picker gets the static
+  // list rather than an error it would have to render as "no models available".
+  it("falls back to the static codex list when no cache file exists", async () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
     const res = await app.request("/api/backends/codex/models", { method: "GET" });
 
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
     const json = await res.json();
-    expect(json.error).toContain("Codex models cache not found");
+    expect(json.map((m: { value: string }) => m.value)).toContain("gpt-5.2-codex");
   });
 
-  it("returns 500 when cache file is malformed", async () => {
+  it("falls back to the static codex list when the cache is malformed", async () => {
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(readFileSync).mockReturnValue("not valid json{{{");
 
     const res = await app.request("/api/backends/codex/models", { method: "GET" });
 
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(200);
     const json = await res.json();
-    expect(json.error).toContain("Failed to parse");
+    expect(json.map((m: { value: string }) => m.value)).toContain("gpt-5.2-codex");
   });
 
-  it("returns 404 for claude backend (uses frontend defaults)", async () => {
+  it("serves claude models instead of deferring to frontend defaults", async () => {
     const res = await app.request("/api/backends/claude/models", { method: "GET" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.map((m: { value: string }) => m.value)).toContain("claude-opus-4-6");
+  });
+
+  // The whole point of the endpoint: a chat started from the UI must open on the model
+  // this machine is actually running, not on whatever heads the static list.
+  it("lists the model of the newest session on that backend first", async () => {
+    launcher.listSessions.mockReturnValue([
+      { sessionId: "s1", state: "running", cwd: "/test", model: "claude-haiku-4-5-20251001", createdAt: 1 },
+      { sessionId: "s2", state: "running", cwd: "/test", model: "claude-sonnet-4-6", createdAt: 2 },
+    ]);
+
+    const res = await app.request("/api/backends/claude/models", { method: "GET" });
+
+    const json = await res.json();
+    expect(json[0].value).toBe("claude-sonnet-4-6");
+  });
+
+  it("returns 404 for an unknown backend", async () => {
+    const res = await app.request("/api/backends/gemini/models", { method: "GET" });
 
     expect(res.status).toBe(404);
   });

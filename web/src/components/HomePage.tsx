@@ -228,20 +228,15 @@ export function HomePage() {
     }
   }
 
-  // Fetch dynamic models for the selected backend
+  // Fetch models for the selected backend. The server lists them with the model this
+  // machine last ran on that backend first, so a new chat opens on the same model the
+  // session was launched with instead of whatever heads the static fallback list.
   useEffect(() => {
-    if (backend !== "codex") {
-      setDynamicModels(null);
-      return;
-    }
     api.getBackendModels(backend).then((models) => {
       if (models.length > 0) {
         const options = toModelOptions(models);
         setDynamicModels(options);
-        // If current model isn't in the list, switch to first
-        if (!options.some((m) => m.value === model)) {
-          setModel(options[0].value);
-        }
+        setModel(options[0].value);
       }
     }).catch(() => {
       // Fall back to hardcoded models silently
