@@ -3451,62 +3451,95 @@ describe("CodexAdapter with ICodexTransport", () => {
   });
 
   it("fires initError after all thread/start retries exhaust", async () => {
-    // When all retry attempts for thread/start fail, initErrorCb should fire.
-    const mock = createMockTransport();
-    const messages: BrowserIncomingMessage[] = [];
-    const initErrors: string[] = [];
-    const adapter = new CodexAdapter(mock.transport, "test-session-transport", { model: "o4-mini" });
-    adapter.onBrowserMessage((msg) => messages.push(msg));
-    adapter.onInitError((err) => initErrors.push(err));
+    // When all retry attempts for thread/start fail, the whole init cycle now
+    // retries with backoff (instead of failing permanently); initErrorCb fires
+    // once that outer budget is also exhausted.
+    vi.useFakeTimers();
+    try {
+      const mock = createMockTransport();
+      const messages: BrowserIncomingMessage[] = [];
+      const initErrors: string[] = [];
+      const adapter = new CodexAdapter(mock.transport, "test-session-transport", { model: "o4-mini" });
+      adapter.onBrowserMessage((msg) => messages.push(msg));
+      adapter.onInitError((err) => initErrors.push(err));
 
-    await new Promise((r) => setTimeout(r, 50));
+      await vi.advanceTimersByTimeAsync(50);
 
-    // Resolve initialize (call #1)
-    mock.resolveCall(1, { userAgent: "codex" });
-    await new Promise((r) => setTimeout(r, 20));
+      // Resolve initialize (call #1)
+      mock.resolveCall(1, { userAgent: "codex" });
+      await vi.advanceTimersByTimeAsync(20);
 
-    // First thread/start (call #2) fails
-    mock.rejectCall(2, new Error("Transport closed"));
-    await new Promise((r) => setTimeout(r, 700));
+      // First thread/start (call #2) fails
+      mock.rejectCall(2, new Error("Transport closed"));
+      await vi.advanceTimersByTimeAsync(700);
 
-    // Second attempt (call #3) also fails
-    mock.rejectCall(3, new Error("Transport closed"));
-    await new Promise((r) => setTimeout(r, 1200));
+      // Second attempt (call #3) also fails
+      mock.rejectCall(3, new Error("Transport closed"));
+      await vi.advanceTimersByTimeAsync(1200);
 
-    // Third attempt (call #4) also fails — this is the last attempt
-    mock.rejectCall(4, new Error("Transport closed"));
-    await new Promise((r) => setTimeout(r, 100));
+      // Third attempt (call #4) also fails — inner thread/start budget spent.
+      // The adapter now schedules a full re-init instead of failing outright.
+      mock.rejectCall(4, new Error("Transport closed"));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(initErrors.length).toBe(0);
 
-    // Init should have failed
-    expect(initErrors.length).toBe(1);
-    expect(initErrors[0]).toContain("Codex initialization failed");
+      // Exhaust the outer init retry budget by failing each re-initialize
+      await vi.advanceTimersByTimeAsync(1000);
+      mock.rejectCall(5, new Error("Transport closed"));
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(2000);
+      mock.rejectCall(6, new Error("Transport closed"));
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(4000);
+      mock.rejectCall(7, new Error("Transport closed"));
+      await vi.advanceTimersByTimeAsync(100);
 
-    // Error message should have been emitted to browser
-    const errors = messages.filter((m) => m.type === "error");
-    expect(errors.length).toBeGreaterThanOrEqual(1);
+      // Init should have failed
+      expect(initErrors.length).toBe(1);
+      expect(initErrors[0]).toContain("Codex initialization failed");
+
+      // Error message should have been emitted to browser
+      const errors = messages.filter((m) => m.type === "error");
+      expect(errors.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("gives up retry immediately on non-Transport-closed error", async () => {
-    // Non-transient errors (not "Transport closed") should not be retried.
-    const mock = createMockTransport();
-    const initErrors: string[] = [];
-    const adapter = new CodexAdapter(mock.transport, "test-session-transport", { model: "o4-mini" });
-    adapter.onInitError((err) => initErrors.push(err));
+    // Non-transient errors (not "Transport closed") should not be retried at
+    // the thread/start level. The full init cycle is retried with backoff
+    // instead — verify no immediate thread/start retry happens, and that the
+    // next call after the backoff is a fresh initialize, not thread/start.
+    vi.useFakeTimers();
+    try {
+      const mock = createMockTransport();
+      const initErrors: string[] = [];
+      const adapter = new CodexAdapter(mock.transport, "test-session-transport", { model: "o4-mini" });
+      adapter.onInitError((err) => initErrors.push(err));
 
-    await new Promise((r) => setTimeout(r, 50));
+      await vi.advanceTimersByTimeAsync(50);
 
-    // Resolve initialize (call #1)
-    mock.resolveCall(1, { userAgent: "codex" });
-    await new Promise((r) => setTimeout(r, 20));
+      // Resolve initialize (call #1)
+      mock.resolveCall(1, { userAgent: "codex" });
+      await vi.advanceTimersByTimeAsync(20);
 
-    // thread/start fails with a non-transient error
-    mock.rejectCall(2, new Error("no rollout found for model"));
-    await new Promise((r) => setTimeout(r, 100));
+      // thread/start fails with a non-transient error
+      mock.rejectCall(2, new Error("no rollout found for model"));
+      await vi.advanceTimersByTimeAsync(100);
 
-    // Should have failed immediately (no retry)
-    expect(initErrors.length).toBe(1);
-    // Only 2 calls should have been made (initialize + one thread/start), no retry
-    expect(mock.calls.length).toBe(2);
+      // No immediate thread/start retry: still only 2 calls, no error surfaced
+      // yet (the outer init retry is backing off)
+      expect(initErrors.length).toBe(0);
+      expect(mock.calls.length).toBe(2);
+
+      // After the backoff, the adapter starts over with a fresh initialize
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mock.calls.length).toBe(3);
+      expect(mock.calls[2]?.method).toBe("initialize");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("falls back to thread/start when thread/resume fails with non-transient error", async () => {
@@ -3564,35 +3597,52 @@ describe("CodexAdapter with ICodexTransport", () => {
   });
 
   it("propagates thread/start failure even after resume fallback", async () => {
-    // If both thread/resume AND the fallback thread/start fail,
-    // the init error should still be reported.
-    const mock = createMockTransport();
-    const initErrors: string[] = [];
-    const adapter = new CodexAdapter(mock.transport, "test-session-transport", {
-      model: "gpt-5.3-codex",
-      cwd: "/workspace",
-      threadId: "thr_broken",
-    });
-    adapter.onInitError((err) => initErrors.push(err));
+    // If both thread/resume AND the fallback thread/start fail, the init
+    // error should still be reported — after the outer init retry budget
+    // (added for transient server errors) is exhausted.
+    vi.useFakeTimers();
+    try {
+      const mock = createMockTransport();
+      const initErrors: string[] = [];
+      const adapter = new CodexAdapter(mock.transport, "test-session-transport", {
+        model: "gpt-5.3-codex",
+        cwd: "/workspace",
+        threadId: "thr_broken",
+      });
+      adapter.onInitError((err) => initErrors.push(err));
 
-    await new Promise((r) => setTimeout(r, 50));
+      await vi.advanceTimersByTimeAsync(50);
 
-    // Resolve initialize (call #1)
-    mock.resolveCall(1, { userAgent: "codex" });
-    await new Promise((r) => setTimeout(r, 20));
+      // Resolve initialize (call #1)
+      mock.resolveCall(1, { userAgent: "codex" });
+      await vi.advanceTimersByTimeAsync(20);
 
-    // thread/resume (call #2) fails
-    mock.rejectCall(2, new Error("no rollout found"));
-    await new Promise((r) => setTimeout(r, 100));
+      // thread/resume (call #2) fails
+      mock.rejectCall(2, new Error("no rollout found"));
+      await vi.advanceTimersByTimeAsync(100);
 
-    // fallback thread/start (call #3) also fails
-    expect(mock.calls[2]?.method).toBe("thread/start");
-    mock.rejectCall(3, new Error("server unavailable"));
-    await new Promise((r) => setTimeout(r, 100));
+      // fallback thread/start (call #3) also fails
+      expect(mock.calls[2]?.method).toBe("thread/start");
+      mock.rejectCall(3, new Error("server unavailable"));
+      await vi.advanceTimersByTimeAsync(100);
 
-    // Should have reported the init error
-    expect(initErrors.length).toBe(1);
-    expect(initErrors[0]).toContain("server unavailable");
+      // Exhaust the outer init retry budget by failing each re-initialize
+      await vi.advanceTimersByTimeAsync(1000);
+      mock.rejectCall(4, new Error("server unavailable"));
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(2000);
+      mock.rejectCall(5, new Error("server unavailable"));
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(4000);
+      mock.rejectCall(6, new Error("server unavailable"));
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Should have reported the init error
+      expect(initErrors.length).toBe(1);
+      expect(initErrors[0]).toContain("server unavailable");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("resetForReconnect re-initializes with new transport", async () => {
