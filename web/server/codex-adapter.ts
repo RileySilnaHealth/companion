@@ -958,9 +958,10 @@ export class CodexAdapter implements IBackendAdapter {
   /** Max retries for thread/start or thread/resume during initialization. */
   private static readonly INIT_THREAD_MAX_RETRIES = 3;
   private static readonly INIT_THREAD_RETRY_BASE_MS = 500;
-  /** Max full initialize() retries, covering transient server-side errors. */
-  private static readonly INIT_MAX_RETRIES = 3;
-  private static readonly INIT_RETRY_BASE_MS = 1000;
+  /** Max full initialize() retries, covering transient server-side errors.
+   *  2s/4s/8s/16s/32s — ~1min total, sized to outlast brief OpenAI outages. */
+  private static readonly INIT_MAX_RETRIES = 5;
+  private static readonly INIT_RETRY_BASE_MS = 2000;
 
   private async initialize(): Promise<void> {
     if (this.initInProgress) {

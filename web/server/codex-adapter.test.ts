@@ -1249,7 +1249,7 @@ describe("CodexAdapter", () => {
       expect(errors.length).toBe(0);
 
       // After the backoff the adapter re-sends initialize; let it succeed
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(2000);
       stdout.push(JSON.stringify({ id: 2, result: { userAgent: "codex" } }) + "\n");
       await vi.advanceTimersByTimeAsync(20);
       stdout.push(JSON.stringify({ id: 3, result: { thread: { id: "thr_retry_1" } } }) + "\n");
@@ -1268,7 +1268,7 @@ describe("CodexAdapter", () => {
   });
 
   it("calls onInitError, rejects messages, and fires disconnect after init retries are exhausted", async () => {
-    // Once the 1s/2s/4s retry budget is spent: one init error surfaces, new
+    // Once the 2s-32s retry budget is spent: one init error surfaces, new
     // messages are rejected, and disconnect fires so auto-relaunch can engage.
     vi.useFakeTimers();
     try {
@@ -1286,14 +1286,18 @@ describe("CodexAdapter", () => {
       const queued = adapter.sendBrowserMessage({ type: "user_message", content: "hello" } as any);
       expect(queued).toBe(true);
 
-      // Fail the initial attempt and all three backoff retries
+      // Fail the initial attempt and all five backoff retries
       stdout.push(JSON.stringify({ id: 1, error: { code: -1, message: "no rollout found" } }) + "\n");
-      await vi.advanceTimersByTimeAsync(1100);
-      stdout.push(JSON.stringify({ id: 2, error: { code: -1, message: "no rollout found" } }) + "\n");
       await vi.advanceTimersByTimeAsync(2100);
-      stdout.push(JSON.stringify({ id: 3, error: { code: -1, message: "no rollout found" } }) + "\n");
+      stdout.push(JSON.stringify({ id: 2, error: { code: -1, message: "no rollout found" } }) + "\n");
       await vi.advanceTimersByTimeAsync(4100);
+      stdout.push(JSON.stringify({ id: 3, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(8100);
       stdout.push(JSON.stringify({ id: 4, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(16100);
+      stdout.push(JSON.stringify({ id: 5, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(32100);
+      stdout.push(JSON.stringify({ id: 6, error: { code: -1, message: "no rollout found" } }) + "\n");
       await vi.advanceTimersByTimeAsync(100);
 
       expect(errors.length).toBe(1);
@@ -3473,15 +3477,12 @@ describe("CodexAdapter with ICodexTransport", () => {
       expect(initErrors.length).toBe(0);
 
       // Exhaust the outer init retry budget by failing each re-initialize
-      await vi.advanceTimersByTimeAsync(1000);
-      mock.rejectCall(5, new Error("Transport closed"));
-      await vi.advanceTimersByTimeAsync(100);
-      await vi.advanceTimersByTimeAsync(2000);
-      mock.rejectCall(6, new Error("Transport closed"));
-      await vi.advanceTimersByTimeAsync(100);
-      await vi.advanceTimersByTimeAsync(4000);
-      mock.rejectCall(7, new Error("Transport closed"));
-      await vi.advanceTimersByTimeAsync(100);
+      const retryDelays = [2000, 4000, 8000, 16000, 32000];
+      for (let i = 0; i < retryDelays.length; i++) {
+        await vi.advanceTimersByTimeAsync(retryDelays[i]);
+        mock.rejectCall(5 + i, new Error("Transport closed"));
+        await vi.advanceTimersByTimeAsync(100);
+      }
 
       // Init should have failed
       expect(initErrors.length).toBe(1);
@@ -3521,7 +3522,7 @@ describe("CodexAdapter with ICodexTransport", () => {
       expect(mock.calls.length).toBe(2);
 
       // After the backoff, the adapter starts over with a fresh initialize
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(2000);
       expect(mock.calls.length).toBe(3);
       expect(mock.calls[2]?.method).toBe("initialize");
     } finally {
@@ -3613,15 +3614,12 @@ describe("CodexAdapter with ICodexTransport", () => {
       await vi.advanceTimersByTimeAsync(100);
 
       // Exhaust the outer init retry budget by failing each re-initialize
-      await vi.advanceTimersByTimeAsync(1000);
-      mock.rejectCall(4, new Error("server unavailable"));
-      await vi.advanceTimersByTimeAsync(100);
-      await vi.advanceTimersByTimeAsync(2000);
-      mock.rejectCall(5, new Error("server unavailable"));
-      await vi.advanceTimersByTimeAsync(100);
-      await vi.advanceTimersByTimeAsync(4000);
-      mock.rejectCall(6, new Error("server unavailable"));
-      await vi.advanceTimersByTimeAsync(100);
+      const retryDelays = [2000, 4000, 8000, 16000, 32000];
+      for (let i = 0; i < retryDelays.length; i++) {
+        await vi.advanceTimersByTimeAsync(retryDelays[i]);
+        mock.rejectCall(4 + i, new Error("server unavailable"));
+        await vi.advanceTimersByTimeAsync(100);
+      }
 
       // Should have reported the init error
       expect(initErrors.length).toBe(1);
