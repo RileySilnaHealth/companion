@@ -958,9 +958,7 @@ export class CodexAdapter implements IBackendAdapter {
   /** Max retries for thread/start or thread/resume during initialization. */
   private static readonly INIT_THREAD_MAX_RETRIES = 3;
   private static readonly INIT_THREAD_RETRY_BASE_MS = 500;
-  /** Max full initialize() retries after a failed attempt (covers server-side
-   *  transient errors like "Server overloaded; retry later." that the
-   *  thread/start retry loop above doesn't handle). */
+  /** Max full initialize() retries, covering transient server-side errors. */
   private static readonly INIT_MAX_RETRIES = 3;
   private static readonly INIT_RETRY_BASE_MS = 1000;
 
@@ -1151,10 +1149,8 @@ export class CodexAdapter implements IBackendAdapter {
       }
       this.initInProgress = false;
 
-      // Transient server-side failures (e.g. "Server overloaded; retry later.")
-      // used to permanently brick the session here: initFailed rejected every
-      // future message and nothing ever re-attempted init. Retry with backoff
-      // instead, keeping pendingOutgoing queued so the user's message survives.
+      // Retry transient failures with backoff, keeping pendingOutgoing queued,
+      // instead of permanently bricking the session on the first failed init.
       if (
         myEpoch === this.initEpoch
         && this.initRetryCount < CodexAdapter.INIT_MAX_RETRIES
@@ -1182,9 +1178,7 @@ export class CodexAdapter implements IBackendAdapter {
       this.pendingOutgoing.length = 0;
       this.emit({ type: "error", message: errorMsg });
       this.initErrorCb?.(errorMsg);
-      // Hand the session to the bridge's disconnect path so the orchestrator's
-      // budgeted auto-relaunch machinery takes over instead of leaving a dead
-      // adapter attached that silently queues messages forever.
+      // Fire the disconnect path so the orchestrator's auto-relaunch takes over.
       this.cleanupAndDisconnect();
     }
   }

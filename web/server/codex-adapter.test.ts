@@ -1222,12 +1222,8 @@ describe("CodexAdapter", () => {
   // ── Init error handling ────────────────────────────────────────────────────
 
   it("retries initialization and recovers when a later attempt succeeds", async () => {
-    // A transient server-side failure during init (e.g. OpenAI returning
-    // "Server overloaded; retry later.") must NOT permanently brick the
-    // session. The adapter retries with backoff, keeps the queued user
-    // message across attempts, and flushes it once a retry succeeds. This is
-    // the regression test for sessions that wedged forever at "Generating"
-    // after a single failed init.
+    // A transient init failure must not brick the session: the adapter retries
+    // with backoff and flushes the queued user message once a retry succeeds.
     vi.useFakeTimers();
     try {
       const messages: BrowserIncomingMessage[] = [];
@@ -1272,14 +1268,8 @@ describe("CodexAdapter", () => {
   });
 
   it("calls onInitError, rejects messages, and fires disconnect after init retries are exhausted", async () => {
-    // Updated contract for the former "calls onInitError when initialization
-    // fails" / "rejects messages and discards queue after init failure" tests:
-    // init failures are now retried with backoff (1s/2s/4s), so the permanent
-    // failure behavior only applies once the retry budget is spent. On
-    // exhaustion the adapter must (a) surface exactly one init error, (b)
-    // reject new messages and discard the queue (no memory leak), and (c)
-    // fire the disconnect callback so the bridge/orchestrator auto-relaunch
-    // machinery takes over instead of leaving a dead adapter attached.
+    // Once the 1s/2s/4s retry budget is spent: one init error surfaces, new
+    // messages are rejected, and disconnect fires so auto-relaunch can engage.
     vi.useFakeTimers();
     try {
       const messages: BrowserIncomingMessage[] = [];
@@ -3451,9 +3441,8 @@ describe("CodexAdapter with ICodexTransport", () => {
   });
 
   it("fires initError after all thread/start retries exhaust", async () => {
-    // When all retry attempts for thread/start fail, the whole init cycle now
-    // retries with backoff (instead of failing permanently); initErrorCb fires
-    // once that outer budget is also exhausted.
+    // Exhausted thread/start retries feed the outer init retry loop;
+    // initErrorCb fires once that budget is also spent.
     vi.useFakeTimers();
     try {
       const mock = createMockTransport();
@@ -3507,10 +3496,8 @@ describe("CodexAdapter with ICodexTransport", () => {
   });
 
   it("gives up retry immediately on non-Transport-closed error", async () => {
-    // Non-transient errors (not "Transport closed") should not be retried at
-    // the thread/start level. The full init cycle is retried with backoff
-    // instead — verify no immediate thread/start retry happens, and that the
-    // next call after the backoff is a fresh initialize, not thread/start.
+    // Non-Transport-closed errors skip the thread/start retry loop; the next
+    // call after the backoff is a fresh initialize, not a thread/start retry.
     vi.useFakeTimers();
     try {
       const mock = createMockTransport();
@@ -3597,9 +3584,8 @@ describe("CodexAdapter with ICodexTransport", () => {
   });
 
   it("propagates thread/start failure even after resume fallback", async () => {
-    // If both thread/resume AND the fallback thread/start fail, the init
-    // error should still be reported — after the outer init retry budget
-    // (added for transient server errors) is exhausted.
+    // When thread/resume and the fallback thread/start both fail, the init
+    // error is still reported after the outer retry budget is exhausted.
     vi.useFakeTimers();
     try {
       const mock = createMockTransport();
