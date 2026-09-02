@@ -1221,53 +1221,107 @@ describe("CodexAdapter", () => {
 
   // ── Init error handling ────────────────────────────────────────────────────
 
-  it("calls onInitError when initialization fails", async () => {
-    const errors: string[] = [];
-    const adapter = new CodexAdapter(proc as never, "test-session", { model: "o4-mini" });
-    adapter.onInitError((err) => errors.push(err));
+  it("retries initialization and recovers when a later attempt succeeds", async () => {
+    // A transient server-side failure during init (e.g. OpenAI returning
+    // "Server overloaded; retry later.") must NOT permanently brick the
+    // session. The adapter retries with backoff, keeps the queued user
+    // message across attempts, and flushes it once a retry succeeds. This is
+    // the regression test for sessions that wedged forever at "Generating"
+    // after a single failed init.
+    vi.useFakeTimers();
+    try {
+      const messages: BrowserIncomingMessage[] = [];
+      const errors: string[] = [];
+      const adapter = new CodexAdapter(proc as never, "test-session", { model: "o4-mini" });
+      adapter.onBrowserMessage((msg) => messages.push(msg));
+      adapter.onInitError((err) => errors.push(err));
 
-    await new Promise((r) => setTimeout(r, 50));
+      await vi.advanceTimersByTimeAsync(50);
 
-    // Send an error response to the initialize request
-    stdout.push(JSON.stringify({
-      id: 1,
-      error: { code: -1, message: "server not ready" },
-    }) + "\n");
+      // Queue a message while init is still in flight — should be accepted
+      const queued = adapter.sendBrowserMessage({ type: "user_message", content: "hello" } as any);
+      expect(queued).toBe(true);
 
-    await new Promise((r) => setTimeout(r, 100));
+      // First initialize attempt fails with a transient server error
+      stdout.push(JSON.stringify({
+        id: 1,
+        error: { code: -1, message: "Server overloaded; retry later." },
+      }) + "\n");
+      await vi.advanceTimersByTimeAsync(20);
 
-    expect(errors.length).toBe(1);
-    expect(errors[0]).toContain("initialization failed");
+      // No error surfaced yet — the adapter is backing off, not giving up
+      expect(errors.length).toBe(0);
+
+      // After the backoff the adapter re-sends initialize; let it succeed
+      await vi.advanceTimersByTimeAsync(1000);
+      stdout.push(JSON.stringify({ id: 2, result: { userAgent: "codex" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(20);
+      stdout.push(JSON.stringify({ id: 3, result: { thread: { id: "thr_retry_1" } } }) + "\n");
+      await vi.advanceTimersByTimeAsync(50);
+
+      // The queued message survived the failed attempt and was flushed
+      const allWritten = stdin.chunks.join("");
+      expect(allWritten).toContain('"method":"turn/start"');
+      expect(allWritten).toContain("hello");
+      const initMsg = messages.find((m) => m.type === "session_init");
+      expect(initMsg).toBeDefined();
+      expect(errors.length).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("rejects messages and discards queue after init failure", async () => {
-    // Verify that after initialization fails, sendBrowserMessage returns false
-    // and any previously queued messages are discarded (no memory leak).
-    const messages: BrowserIncomingMessage[] = [];
-    const adapter = new CodexAdapter(proc as never, "test-session", { model: "o4-mini" });
-    adapter.onBrowserMessage((msg) => messages.push(msg));
+  it("calls onInitError, rejects messages, and fires disconnect after init retries are exhausted", async () => {
+    // Updated contract for the former "calls onInitError when initialization
+    // fails" / "rejects messages and discards queue after init failure" tests:
+    // init failures are now retried with backoff (1s/2s/4s), so the permanent
+    // failure behavior only applies once the retry budget is spent. On
+    // exhaustion the adapter must (a) surface exactly one init error, (b)
+    // reject new messages and discard the queue (no memory leak), and (c)
+    // fire the disconnect callback so the bridge/orchestrator auto-relaunch
+    // machinery takes over instead of leaving a dead adapter attached.
+    vi.useFakeTimers();
+    try {
+      const messages: BrowserIncomingMessage[] = [];
+      const errors: string[] = [];
+      const disconnectCb = vi.fn();
+      const adapter = new CodexAdapter(proc as never, "test-session", { model: "o4-mini" });
+      adapter.onBrowserMessage((msg) => messages.push(msg));
+      adapter.onInitError((err) => errors.push(err));
+      adapter.onDisconnect(disconnectCb);
 
-    await new Promise((r) => setTimeout(r, 50));
+      await vi.advanceTimersByTimeAsync(50);
 
-    // Queue a message before init completes — should be accepted
-    const queued = adapter.sendBrowserMessage({ type: "user_message", content: "hello" } as any);
-    expect(queued).toBe(true);
+      // Queue a message before init completes — should be accepted
+      const queued = adapter.sendBrowserMessage({ type: "user_message", content: "hello" } as any);
+      expect(queued).toBe(true);
 
-    // Fail init
-    stdout.push(JSON.stringify({
-      id: 1,
-      error: { code: -1, message: "no rollout found" },
-    }) + "\n");
+      // Fail the initial attempt and all three backoff retries
+      stdout.push(JSON.stringify({ id: 1, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(1100);
+      stdout.push(JSON.stringify({ id: 2, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(2100);
+      stdout.push(JSON.stringify({ id: 3, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(4100);
+      stdout.push(JSON.stringify({ id: 4, error: { code: -1, message: "no rollout found" } }) + "\n");
+      await vi.advanceTimersByTimeAsync(100);
 
-    await new Promise((r) => setTimeout(r, 100));
+      expect(errors.length).toBe(1);
+      expect(errors[0]).toContain("initialization failed");
 
-    // After init failure, new messages should be rejected
-    const rejected = adapter.sendBrowserMessage({ type: "user_message", content: "world" } as any);
-    expect(rejected).toBe(false);
+      // After exhaustion, new messages should be rejected
+      const rejected = adapter.sendBrowserMessage({ type: "user_message", content: "world" } as any);
+      expect(rejected).toBe(false);
 
-    // The error message should have been emitted to the browser
-    const errorMsg = messages.find((m) => m.type === "error");
-    expect(errorMsg).toBeDefined();
+      // The error message should have been emitted to the browser
+      const errorMsg = messages.find((m) => m.type === "error");
+      expect(errorMsg).toBeDefined();
+
+      // Disconnect fired exactly once so the relaunch machinery can engage
+      expect(disconnectCb).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── Session resume ──────────────────────────────────────────────────────────
