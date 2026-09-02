@@ -475,6 +475,10 @@ export class CodexAdapter implements IBackendAdapter {
   private static readonly MAX_RECONNECT_RETRIES = 5;
   /** Timer handle for the -32001 overload backoff retry, so we can cancel it on reconnect. */
   private overloadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Number of consecutive failed initialize() attempts for the current init cycle. */
+  private initRetryCount = 0;
+  /** Timer handle for the init retry backoff, so it can be cancelled on reconnect/teardown. */
+  private initRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /** The message captured in the overload retry timer closure, so it can be
    *  rescued to pendingOutgoing if the timer is cancelled by a reconnect. */
   private overloadRetryMsg: BrowserOutgoingMessage | null = null;
@@ -698,6 +702,8 @@ export class CodexAdapter implements IBackendAdapter {
     this.initInProgress = false;
     this.initialized = false;
     this.initFailed = false;
+    if (this.initRetryTimer) { clearTimeout(this.initRetryTimer); this.initRetryTimer = null; }
+    this.initRetryCount = 0;
     if (!this.options.threadId && this.threadId) {
       this.options.threadId = this.threadId;
     }
@@ -712,6 +718,7 @@ export class CodexAdapter implements IBackendAdapter {
     this.connected = false;
     this.overloadRetryMsg = null; // No rescue needed — session is being torn down
     if (this.overloadRetryTimer) { clearTimeout(this.overloadRetryTimer); this.overloadRetryTimer = null; }
+    if (this.initRetryTimer) { clearTimeout(this.initRetryTimer); this.initRetryTimer = null; }
     for (const pending of this.pendingDynamicToolCalls.values()) {
       clearTimeout(pending.timeout);
     }
@@ -738,6 +745,8 @@ export class CodexAdapter implements IBackendAdapter {
     this.initEpoch++;
     this.initInProgress = false;
     this.disconnectFired = false;
+    if (this.initRetryTimer) { clearTimeout(this.initRetryTimer); this.initRetryTimer = null; }
+    this.initRetryCount = 0;
 
     // Clean up stale approval and per-item state from the old transport.
     // The new Codex process won't know about old request IDs.
@@ -949,6 +958,10 @@ export class CodexAdapter implements IBackendAdapter {
   /** Max retries for thread/start or thread/resume during initialization. */
   private static readonly INIT_THREAD_MAX_RETRIES = 3;
   private static readonly INIT_THREAD_RETRY_BASE_MS = 500;
+  /** Max full initialize() retries, covering transient server-side errors.
+   *  2s/4s/8s/16s/32s — ~1min total, sized to outlast brief OpenAI outages. */
+  private static readonly INIT_MAX_RETRIES = 5;
+  private static readonly INIT_RETRY_BASE_MS = 2000;
 
   private async initialize(): Promise<void> {
     if (this.initInProgress) {
@@ -1079,6 +1092,7 @@ export class CodexAdapter implements IBackendAdapter {
       // succeeds — without this, the counter would accumulate across
       // reconnect cycles and eventually trigger cleanupAndDisconnect().
       this.reconnectRetryCount = 0;
+      this.initRetryCount = 0;
       console.log(`[codex-adapter] Session ${this.sessionId} initialized (threadId=${this.threadId})`);
 
       // Notify session metadata
@@ -1135,15 +1149,38 @@ export class CodexAdapter implements IBackendAdapter {
         return;
       }
       this.initInProgress = false;
+
+      // Retry transient failures with backoff, keeping pendingOutgoing queued,
+      // instead of permanently bricking the session on the first failed init.
+      if (
+        myEpoch === this.initEpoch
+        && this.initRetryCount < CodexAdapter.INIT_MAX_RETRIES
+        && this.transport.isConnected()
+      ) {
+        const attempt = ++this.initRetryCount;
+        const delay = CodexAdapter.INIT_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+        console.warn(
+          `[codex-adapter] Session ${this.sessionId}: init attempt failed (${err}), retrying in ${delay}ms (attempt ${attempt}/${CodexAdapter.INIT_MAX_RETRIES})`,
+        );
+        this.initRetryTimer = setTimeout(() => {
+          this.initRetryTimer = null;
+          if (myEpoch !== this.initEpoch) return; // superseded by a reconnect cycle
+          this.initialize();
+        }, delay);
+        return;
+      }
+
       const errorMsg = `Codex initialization failed: ${err}`;
       console.error(`[codex-adapter] ${errorMsg}`);
       this.initFailed = true;
       this.connected = false;
-      // Discard any messages queued during the failed init attempt
+      // Discard any messages queued during the failed init attempts
       if (this.overloadRetryTimer) { clearTimeout(this.overloadRetryTimer); this.overloadRetryTimer = null; }
       this.pendingOutgoing.length = 0;
       this.emit({ type: "error", message: errorMsg });
       this.initErrorCb?.(errorMsg);
+      // Fire the disconnect path so the orchestrator's auto-relaunch takes over.
+      this.cleanupAndDisconnect();
     }
   }
 
