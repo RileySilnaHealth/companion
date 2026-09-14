@@ -25,6 +25,15 @@ let queue = [];
 let connectAttempt = 0;
 const startedAt = Date.now();
 
+// A failed connection fires BOTH "error" and "close" on the same socket, and a
+// post-open drop does the same. Each used to schedule its own connect(), so
+// in-flight attempts doubled every round (1, 2, 4, 8...). The extra sockets all
+// connect once Codex starts listening, each overwriting `ws`, which splits the
+// JSON-RPC handshake across connections: `initialize` lands on one socket and
+// `thread/start` on another, and Codex rejects the latter with "Not
+// initialized". One pending attempt at a time keeps the session on one socket.
+let retryTimer = null;
+
 // Reconnection state — after a successful initial connection, transient
 // WebSocket drops are retried with exponential backoff before giving up.
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -90,11 +99,23 @@ function failAndExit(message, code = 1) {
 }
 
 /**
+ * Queue a single connect() attempt. Calls made while an attempt is already
+ * pending are dropped so concurrent sockets never stack up.
+ */
+function scheduleRetry(delay) {
+  if (closed || exiting || retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connect();
+  }, delay);
+}
+
+/**
  * Attempt to reconnect after a post-open WebSocket drop.
  * Uses exponential backoff up to MAX_RECONNECT_ATTEMPTS before giving up.
  */
 function scheduleReconnect(reason) {
-  if (closed || exiting) return;
+  if (closed || exiting || retryTimer) return;
   stopHeartbeat();
   reconnectAttempt++;
   if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
@@ -105,7 +126,7 @@ function scheduleReconnect(reason) {
   reconnecting = true;
   const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, reconnectAttempt - 1), RECONNECT_MAX_MS);
   log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS}) — ${reason}`);
-  setTimeout(connect, delay);
+  scheduleRetry(delay);
 }
 
 function connect() {
@@ -121,9 +142,17 @@ function connect() {
     }
   }
 
-  ws = new WebSocket(url, { perMessageDeflate: false });
+  const socket = new WebSocket(url, { perMessageDeflate: false });
+  ws = socket;
+  // Every handler ignores a socket that is no longer the active one, so a
+  // straggler from an earlier attempt can never carry protocol traffic.
+  const isStale = () => socket !== ws;
 
-  ws.once("open", () => {
+  socket.once("open", () => {
+    if (isStale()) {
+      try { socket.terminate(); } catch {}
+      return;
+    }
     if (!opened) {
       opened = true;
     }
@@ -147,35 +176,39 @@ function connect() {
     }
   });
 
-  ws.on("message", (data) => {
+  socket.on("message", (data) => {
+    if (isStale()) return;
     const raw = decodeMessageData(data);
     // stdout is protocol channel: ONLY write payload lines
     process.stdout.write(raw + "\n");
   });
 
-  ws.on("pong", () => {
+  socket.on("pong", () => {
+    if (isStale()) return;
     // Heartbeat response received — connection is alive
     if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
   });
 
-  ws.once("close", (code, reason) => {
+  socket.once("close", (code, reason) => {
+    if (isStale()) return;
     stopHeartbeat();
     if (closed || exiting) return;
     const why = reason ? ` reason=${reason}` : "";
     // If connection closes before we ever opened, keep retrying until timeout.
     if (!opened) {
-      setTimeout(connect, Math.min(100 * connectAttempt, 500));
+      scheduleRetry(Math.min(100 * connectAttempt, 500));
       return;
     }
     // Post-open close — attempt reconnection with backoff
     scheduleReconnect(`WebSocket closed (code=${code}${why})`);
   });
 
-  ws.once("error", (err) => {
+  socket.once("error", (err) => {
+    if (isStale()) return;
     if (closed || exiting) return;
     // Retry during startup; after a successful connection, use reconnect logic.
     if (!opened) {
-      setTimeout(connect, Math.min(100 * connectAttempt, 500));
+      scheduleRetry(Math.min(100 * connectAttempt, 500));
       return;
     }
     // Post-open error — attempt reconnection with backoff
