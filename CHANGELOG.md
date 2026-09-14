@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.97.0](https://github.com/RileySilnaHealth/companion/compare/the-companion-v0.96.0...the-companion-v0.97.0) (2026-09-14)
+
+
+### Features
+
+* **ui:** add context window usage bar to TopBar ([#9](https://github.com/RileySilnaHealth/companion/issues/9)) ([1ffdba9](https://github.com/RileySilnaHealth/companion/commit/1ffdba92cb0e23896a71d5ce95c541ad25fc4875))
+
+
+### Bug Fixes
+
+* **codex:** never stack concurrent app-server connections ([#17](https://github.com/RileySilnaHealth/companion/issues/17)) ([030f263](https://github.com/RileySilnaHealth/companion/commit/030f26375935e7c63e24f21dc1b24afd89456a5c))
+* **models:** open new chats on the model this machine is running ([#15](https://github.com/RileySilnaHealth/companion/issues/15)) ([94dd881](https://github.com/RileySilnaHealth/companion/commit/94dd881825bb79d2da9909c99b3eb35b026bcbb7))
+* **ui:** prevent unnecessary re-renders that break text selection ([#11](https://github.com/RileySilnaHealth/companion/issues/11)) ([9314fe5](https://github.com/RileySilnaHealth/companion/commit/9314fe5cab79fbc333382b79c10876666b038d60))
+
 ## [0.96.0](https://github.com/RileySilnaHealth/companion/compare/the-companion-v0.95.0...the-companion-v0.96.0) (2026-04-15)
 
 
